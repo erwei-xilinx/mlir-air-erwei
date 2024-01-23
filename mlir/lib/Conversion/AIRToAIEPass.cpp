@@ -2278,7 +2278,8 @@ public:
                                      : ndcpy.getSrcStrides();
 
     int64_t len = getMemcpySizesAsInt(memref, sizes);
-    int64_t offset = get1DOffset(offsets, memref);
+    int64_t offset =
+        get1DOffset(offsets, strides, getElementSizeInBytes(memref.getType()));
 
     Value length =
         b.create<arith::ConstantIndexOp>(memcpyOp.getLoc(), len)->getResult(0);
