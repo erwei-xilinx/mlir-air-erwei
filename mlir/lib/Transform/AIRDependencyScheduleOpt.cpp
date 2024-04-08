@@ -3560,110 +3560,6 @@ private:
   }
 };
 
-// A pattern which attempts to shrink the memref sizes, based on the access
-// patterns of all its uses.
-struct ShrinkMemrefSizesByAccessPattern
-    : public OpRewritePattern<memref::AllocOp> {
-  using OpRewritePattern<memref::AllocOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(memref::AllocOp alloc,
-                                PatternRewriter &rewriter) const override {
-
-    // Get memref.
-    Value memref = alloc.getMemref();
-    if (auto exec = dyn_cast<air::ExecuteOp>(alloc->getParentOp()))
-      memref = exec->getResult(1);
-
-    if (alloc->hasAttr("shrinkage"))
-      return failure();
-
-    // Get dealloc.
-    memref::DeallocOp dealloc;
-    // Get channel op users.
-    SmallVector<air::ChannelGetOp> gets;
-    SmallVector<air::ChannelPutOp> puts;
-    SmallVector<air::ChannelInterface> chanOps;
-    for (auto user : memref.getUsers()) {
-      if (auto da = dyn_cast<memref::DeallocOp>(user))
-        dealloc = da;
-      else if (auto chanOp = dyn_cast<air::ChannelInterface>(user))
-        chanOps.push_back(chanOp);
-      else
-        return failure(); // NYI.
-    }
-
-    // Analyze data access pattern.
-    SmallVector<int64_t> overall_access_bounds =
-        air::getDataAccessShapeFromMemcpyOp(memref, chanOps);
-    auto memref_shape = getTensorShape(memref.getType());
-
-    bool shrinkMemref = false;
-    for (unsigned i = 0; i < memref_shape.size(); i++) {
-      if (overall_access_bounds[i] < 0)
-        return failure();
-      if (overall_access_bounds[i] < memref_shape[i]) {
-        shrinkMemref = true;
-      }
-    }
-    if (shrinkMemref) {
-      // Start shrinking memref.
-      for (auto chanOp : chanOps) {
-        rewriter.setInsertionPoint(chanOp);
-        auto new_strides = getUpdatedStridesAfterShrinkage(
-            memref_shape, overall_access_bounds, chanOp.getStrides());
-        int strideListIdxOffset =
-            dyn_cast<air::AsyncOpInterface>(chanOp.getOperation())
-                .getAsyncDependencies()
-                .size() +
-            chanOp.getIndices().size() + chanOp.getOffsets().size() +
-            chanOp.getSizes().size() + 1;
-        for (unsigned i = strideListIdxOffset;
-             i < strideListIdxOffset + chanOp.getStrides().size(); i++) {
-          chanOp->getOpOperand(i).assign(
-              rewriter.create<arith::ConstantIndexOp>(
-                  chanOp->getLoc(), new_strides[i - strideListIdxOffset]));
-        }
-      }
-
-      // Replace memref alloc op;
-      Type elemType = memref.getType().cast<MemRefType>().getElementType();
-      Attribute memorySpace =
-          memref.getType().cast<MemRefType>().getMemorySpace();
-      auto newMemrefType = MemRefType::get(overall_access_bounds, elemType,
-                                           nullptr, memorySpace);
-      if (auto execOp = dyn_cast<air::ExecuteOp>(alloc->getParentOp())) {
-        rewriter.setInsertionPoint(execOp);
-        auto newExecOp = rewriter.create<air::ExecuteOp>(
-            execOp->getLoc(), air::AsyncTokenType::get(rewriter.getContext()),
-            newMemrefType, execOp.getAsyncDependencies());
-        Block *async_exec_bb = rewriter.createBlock(&newExecOp.getBody());
-        rewriter.setInsertionPointToStart(async_exec_bb);
-        auto newAlloc =
-            rewriter.create<memref::AllocOp>(alloc->getLoc(), newMemrefType);
-        newAlloc->setAttr("shrinkage", rewriter.getBoolAttr(true));
-        rewriter.create<air::ExecuteTerminatorOp>(rewriter.getUnknownLoc(),
-                                                  newAlloc.getResult());
-        for (unsigned i = 0; i < execOp->getNumResults(); i++)
-          execOp->getResult(i).replaceAllUsesWith(newExecOp->getResult(i));
-        rewriter.eraseOp(execOp);
-
-      } else {
-        rewriter.setInsertionPoint(alloc);
-        auto newAlloc =
-            rewriter.create<memref::AllocOp>(alloc->getLoc(), newMemrefType);
-        newAlloc->setAttr("shrinkage", rewriter.getBoolAttr(true));
-        alloc.getResult().replaceAllUsesWith(newAlloc.getResult());
-        rewriter.eraseOp(alloc);
-      }
-      return success();
-    }
-
-    return failure();
-  }
-
-private:
-};
-
 // A pass which performs loop fusion within air.segment op's region.
 class AIRSegmentLoopFusion
     : public xilinx::air::impl::AIRSegmentLoopFusionBase<AIRSegmentLoopFusion> {
@@ -3882,11 +3778,104 @@ public:
     (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
   }
 
+  // A method which attempts to shrink the memref sizes, based on the access
+  // patterns of all its uses.
+  void ShrinkMemrefSizesByAccess(memref::AllocOp alloc) {
+    // Get memref.
+    Value memref = alloc.getMemref();
+    if (auto exec = dyn_cast<air::ExecuteOp>(alloc->getParentOp()))
+      memref = exec->getResult(1);
+
+    if (alloc->hasAttr("shrinkage"))
+      return;
+
+    // Get dealloc.
+    memref::DeallocOp dealloc;
+    // Get channel op users.
+    SmallVector<air::ChannelGetOp> gets;
+    SmallVector<air::ChannelPutOp> puts;
+    SmallVector<air::ChannelInterface> chanOps;
+    for (auto user : memref.getUsers()) {
+      if (auto da = dyn_cast<memref::DeallocOp>(user))
+        dealloc = da;
+      else if (auto chanOp = dyn_cast<air::ChannelInterface>(user))
+        chanOps.push_back(chanOp);
+      else
+        return; // Other operations NYI.
+    }
+
+    // Analyze data access pattern.
+    SmallVector<int64_t> overall_access_bounds =
+        air::getDataAccessShapeFromMemcpyOp(memref, chanOps);
+    auto memref_shape = getTensorShape(memref.getType());
+
+    bool shrinkMemref = false;
+    for (unsigned i = 0; i < memref_shape.size(); i++) {
+      if (overall_access_bounds[i] < 0)
+        return;
+      if (overall_access_bounds[i] < memref_shape[i]) {
+        shrinkMemref = true;
+      }
+    }
+    if (shrinkMemref) {
+      OpBuilder builder(alloc);
+      // Start shrinking memref.
+      for (auto chanOp : chanOps) {
+        builder.setInsertionPoint(chanOp);
+        auto new_strides = getUpdatedStridesAfterShrinkage(
+            memref_shape, overall_access_bounds, chanOp.getStrides());
+        int strideListIdxOffset =
+            dyn_cast<air::AsyncOpInterface>(chanOp.getOperation())
+                .getAsyncDependencies()
+                .size() +
+            chanOp.getIndices().size() + chanOp.getOffsets().size() +
+            chanOp.getSizes().size() + 1;
+        for (unsigned i = strideListIdxOffset;
+             i < strideListIdxOffset + chanOp.getStrides().size(); i++) {
+          chanOp->getOpOperand(i).assign(builder.create<arith::ConstantIndexOp>(
+              chanOp->getLoc(), new_strides[i - strideListIdxOffset]));
+        }
+      }
+
+      // Replace memref alloc op;
+      Type elemType = memref.getType().cast<MemRefType>().getElementType();
+      Attribute memorySpace =
+          memref.getType().cast<MemRefType>().getMemorySpace();
+      auto newMemrefType = MemRefType::get(overall_access_bounds, elemType,
+                                           nullptr, memorySpace);
+      if (auto execOp = dyn_cast<air::ExecuteOp>(alloc->getParentOp())) {
+        builder.setInsertionPoint(execOp);
+        auto newExecOp = builder.create<air::ExecuteOp>(
+            execOp->getLoc(), air::AsyncTokenType::get(builder.getContext()),
+            newMemrefType, execOp.getAsyncDependencies());
+        Block *async_exec_bb = builder.createBlock(&newExecOp.getBody());
+        builder.setInsertionPointToStart(async_exec_bb);
+        auto newAlloc =
+            builder.create<memref::AllocOp>(alloc->getLoc(), newMemrefType);
+        newAlloc->setAttr("shrinkage", builder.getBoolAttr(true));
+        builder.create<air::ExecuteTerminatorOp>(builder.getUnknownLoc(),
+                                                 newAlloc.getResult());
+        for (unsigned i = 0; i < execOp->getNumResults(); i++)
+          execOp->getResult(i).replaceAllUsesWith(newExecOp->getResult(i));
+        execOp->erase();
+
+      } else {
+        builder.setInsertionPoint(alloc);
+        auto newAlloc =
+            builder.create<memref::AllocOp>(alloc->getLoc(), newMemrefType);
+        newAlloc->setAttr("shrinkage", builder.getBoolAttr(true));
+        alloc.getResult().replaceAllUsesWith(newAlloc.getResult());
+        alloc->erase();
+      }
+    }
+  }
+
   void runPostProcPatterns(func::FuncOp funcOp) {
-    MLIRContext *ctx = funcOp.getContext();
-    RewritePatternSet patterns(&getContext());
-    patterns.insert<ShrinkMemrefSizesByAccessPattern>(ctx);
-    (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
+    SmallVector<memref::AllocOp> allocOps;
+    funcOp.walk([&](memref::AllocOp allocOp) { allocOps.push_back(allocOp); });
+    // Attempt to shrink memref sizes by analyzing data access pattern
+    for (auto alloc : allocOps)
+      ShrinkMemrefSizesByAccess(alloc);
   }
 
   void runOnOperation() override {
