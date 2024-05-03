@@ -3891,9 +3891,7 @@ private:
               return failure();
           }
         }
-
-      } else
-        return failure(); // NYI.
+      }
     }
     return success();
   }
