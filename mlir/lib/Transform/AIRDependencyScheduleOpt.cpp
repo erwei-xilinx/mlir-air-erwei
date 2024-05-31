@@ -1468,28 +1468,40 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
     if (for_op->hasAttr("unroll"))
       return failure();
 
-    // Check if the loop has child air.execute event containing memref.alloc
+    SmallVector<Value> usedMemrefs;
+    for_op.getBody()->walk([&](Operation *op) {
+      for (auto oper : op->getOperands())
+        if (isa<MemRefType>(oper.getType()))
+          push_back_if_unique<Value>(usedMemrefs, oper);
+    });
+    for (auto memref : usedMemrefs)
+      for (auto user : memref.getUsers())
+        if (!for_op->isProperAncestor(user))
+          // Found memref used outside of the loop.
+          return failure();
+
     SmallVector<Operation *> alloc_ops;
-    for (auto child_exec : for_op.getOps<air::ExecuteOp>()) {
-      for (auto child_alloc : child_exec.getOps<memref::AllocOp>()) {
+    for (auto child_exec : for_op.getOps<air::ExecuteOp>())
+      for (auto child_alloc : child_exec.getOps<memref::AllocOp>())
         alloc_ops.push_back(child_alloc.getOperation());
-      }
-    }
-    if (alloc_ops.empty())
-      return failure();
 
     // Label the scf.for loop and all its child memref.allocs
     int unroll_factor = 2; // Unroll factor hardened as 2. TODO: add support for
                            // an arbitrary factor.
     for_op->setAttr("unroll", rewriter.getI32IntegerAttr(unroll_factor));
-    for (auto op : alloc_ops) {
+    // Label memref.alloc to be hoisted outside of the loop.
+    for (auto op : alloc_ops)
       op->setAttr("hoist_alloc", rewriter.getBoolAttr(true));
-    }
 
     return success();
   }
 
 private:
+  template <typename T>
+  void push_back_if_unique(SmallVector<T> &vec, T entry) const {
+    if (std::find(vec.begin(), vec.end(), entry) == vec.end())
+      vec.push_back(entry);
+  }
 };
 
 struct LabelScfForLoopInAIRSegment : public OpRewritePattern<scf::ForOp> {
