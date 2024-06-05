@@ -474,21 +474,37 @@ struct HoistAIRChannelInAccumPattern : public OpRewritePattern<scf::ForOp> {
           }
           // Hoist all other channel ops sharing the same channels out of their
           // parent for loops.
-          for (auto for_op : other_for_ops) {
-            if (*getConstantIntValue(for_op.getLowerBound()) == 0)
-              for_op.getUpperBoundMutable().assign(for_op.getStep());
+          for (auto ofo : other_for_ops) {
+            if (*getConstantIntValue(ofo.getLowerBound()) == 0)
+              ofo.getUpperBoundMutable().assign(ofo.getStep());
             else
-              for_op.getUpperBoundMutable().assign(
+              ofo.getUpperBoundMutable().assign(
                   rewriter.create<arith::ConstantIndexOp>(
-                      for_op->getLoc(),
-                      *getConstantIntValue(for_op.getLowerBound()) +
-                          *getConstantIntValue(for_op.getStep())));
+                      ofo->getLoc(),
+                      *getConstantIntValue(ofo.getLowerBound()) +
+                          *getConstantIntValue(ofo.getStep())));
           }
         }
       }
       if (foundPairForThisOp2)
         continue; // Ensure unique pairing
     }
+
+    // Reconstruct loop-carried dependency
+    // SmallVector<Value> danglingIterArgs;
+    // for (auto iterArg : for_op.getRegionIterArgs())
+    //   if (isa<air::AsyncTokenType>(iterArg.getType()) && iterArg.use_empty())
+    //     danglingIterArgs.push_back(iterArg);
+    // for (auto iterArg : danglingIterArgs){
+    //   for_op.getBody()->walk([&](air::AsyncOpInterface async_op) {
+    //     if (async_op.getAsyncDependencies().empty())
+    //       async_op.addAsyncDependency(iterArg);
+    //   });
+    // }
+
+
+    // updateDependencyInBlock(for_op.getBody());
+
     if (foundPairToHoist)
       return success();
     return failure();
@@ -547,6 +563,35 @@ private:
       return false; // Unsupported data consumer op.
     return op_1_memref == op_2_memref;
   }
+
+  // // Update dependency in block.
+  // void updateDependencyInBlock(Block * bb) const {
+  //   air::dependencyTracer depTracer;
+  //   bb->walk([&](air::AsyncOpInterface async_op) {
+  //     // Connect async dependency of external put/get scf parallel
+  //     SmallVector<air::partialMemref, 1> sink_op_memref_reads;
+  //     SmallVector<air::partialMemref, 1> sink_op_memref_writes;
+  //     SmallVector<Value, 1> sink_op_scalar_ins;
+  //     SmallVector<Value, 1> sink_op_scalar_outs;
+
+  //     depTracer.getPartialMemrefFromOp(
+  //         async_op.getOperation(), sink_op_memref_reads,
+  //         sink_op_memref_writes, sink_op_scalar_ins, sink_op_scalar_outs);
+
+  //     depTracer.template traceDependencyFromOp<air::AsyncOpInterface>(
+  //         sink_op_memref_reads,
+  //         dyn_cast<air::AsyncOpInterface>(async_op.getOperation()), "RAW");
+  //     depTracer.template traceDependencyFromOp<air::AsyncOpInterface>(
+  //         sink_op_memref_writes,
+  //         dyn_cast<air::AsyncOpInterface>(async_op.getOperation()),
+  //         "WAW/WAR");
+  //     // Detect tile index deps
+  //     depTracer.traceTileIndices(
+  //         sink_op_memref_reads, sink_op_memref_writes, sink_op_scalar_ins,
+  //         sink_op_scalar_outs,
+  //         dyn_cast<air::AsyncOpInterface>(async_op.getOperation()));
+  //   });
+  // }
 };
 
 struct AnnotateFrontAndBackOpsInForPattern
@@ -567,32 +612,49 @@ struct AnnotateFrontAndBackOpsInForPattern
         iterTokens.push_back(iter_arg);
       }
     }
-    if (!iterTokens.size())
-      return failure();
+    // if (!iterTokens.size())
+    //   return failure();
 
     // Get async alloc ops
     SmallVector<Operation *> allocOps;
-    for (auto &op : for_op.getOps()) {
-      if (auto exec_op = dyn_cast<air::ExecuteOp>(op)) {
-        bool isFrontCandidate = false;
-        if (!exec_op.getAsyncDependencies().size())
-          isFrontCandidate = true;
-        for (auto d : exec_op.getAsyncDependencies()) {
-          for (auto t : iterTokens) {
-            if (d == t) {
-              isFrontCandidate = true;
-            }
-          }
+    // for (auto &op : for_op.getOps()) {
+    //   if (auto exec_op = dyn_cast<air::ExecuteOp>(op)) {
+    //     bool isFrontCandidate = false;
+    //     if (!exec_op.getAsyncDependencies().size())
+    //       isFrontCandidate = true;
+    //     for (auto d : exec_op.getAsyncDependencies()) {
+    //       for (auto t : iterTokens) {
+    //         if (d == t) {
+    //           isFrontCandidate = true;
+    //         }
+    //       }
+    //     }
+    //     auto child_op = exec_op.getChildOp();
+    //     if (isa<memref::AllocOp>(child_op) && isFrontCandidate) {
+    //       iterTokens.push_back(op.getResult(0));
+    //       // Note: skipping over alloc ops, since they will get hoisted out of
+    //       // loop
+    //       allocOps.push_back(&op);
+    //     }
+    //   }
+    // }
+    for_op.getBody()->walk([&](Operation * for_op_child) {
+      for (auto oper : for_op_child->getOperands()){
+        if (!isa<MemRefType>(oper.getType())) continue;
+        auto alloc = oper.getDefiningOp();
+        // if (!alloc) continue; // TODO: climb across air.herd
+        if (!alloc) {
+          auto memrefBlockArg = dyn_cast<BlockArgument>(oper);
+          if (!memrefBlockArg) continue;
+          auto herd = dyn_cast<air::HerdOp>(memrefBlockArg.getOwner()->getParentOp());
+          if (!herd) continue;
+          alloc = getHerdOperandFromHerdArgument(herd, oper).getDefiningOp();
         }
-        auto child_op = exec_op.getChildOp();
-        if (isa<memref::AllocOp>(child_op) && isFrontCandidate) {
-          iterTokens.push_back(op.getResult(0));
-          // Note: skipping over alloc ops, since they will get hoisted out of
-          // loop
-          allocOps.push_back(&op);
-        }
+        allocOps.push_back(alloc);
+        if (auto exec = dyn_cast<air::ExecuteOp>(alloc))
+          iterTokens.push_back(exec->getResult(0));
       }
-    }
+    });
     if (!allocOps.size())
       return failure();
 
@@ -702,6 +764,17 @@ private:
       return wa_op.getOperation();
     } else
       return op;
+  }
+
+  // Get herd operand to a herd argument
+  Value getHerdOperandFromHerdArgument(air::HerdOp herdOp,
+                                               Value v) const {
+    auto blockArg = llvm::dyn_cast<BlockArgument>(v);
+    assert(blockArg.getOwner()->getParentOp() == herdOp);
+    for (unsigned i = 0; i < herdOp.getNumKernelOperands(); i++)
+      if (herdOp.getKernelArgument(i) == blockArg)
+        return herdOp.getKernelOperand(i);
+    return nullptr;
   }
 };
 
@@ -867,6 +940,7 @@ struct HoistAIRHerdInForPattern : public OpRewritePattern<air::HerdOp> {
               .create<air::WaitAllOp>(loc, air::AsyncTokenType::get(ctx),
                                       SmallVector<Value>{})
               .getAsyncToken();
+      // newAsyncToken.getDefiningOp()->setAttr("broken", rewriter.getBoolAttr(true));
       replaceAllUsesInRegionWith(val, newAsyncToken, newHerdOp.getBody());
     }
     for (auto loop : for_loop_nest) {
@@ -892,13 +966,29 @@ struct HoistAIRHerdInForPattern : public OpRewritePattern<air::HerdOp> {
     auto &body = herdOp.getBody().front().getOperations();
     bb.splice(bb.begin(), body, body.begin(), --body.end());
 
+    // // Collect dangling outgoing tokens fron herd to be yielded in new for loop.
+    // SmallVector<Value> danglingOutgoingToks;
+    // for (auto &bb_op : bb){
+    //   auto async_bb_op = dyn_cast<air::AsyncOpInterface>(bb_op);
+    //   if (!async_bb_op) continue;
+    //   auto async_bb_op_tok = async_bb_op.getAsyncToken();
+    //   if (async_bb_op_tok.use_empty()) danglingOutgoingToks.push_back(async_bb_op_tok);
+    // }
     rewriter.setInsertionPoint(herdOp);
-    for (auto res : herdOp->getResults())
-      res.replaceAllUsesWith(
-          rewriter
+    // for (auto res : herdOp->getResults()){
+    //   auto yield_wa = rewriter
+    //           .create<air::WaitAllOp>(loc, air::AsyncTokenType::get(ctx),
+    //                                   danglingOutgoingToks);
+    //   res.replaceAllUsesWith(
+    //           yield_wa.getAsyncToken());
+    // }
+    for (auto res : herdOp->getResults()){
+      auto yield_wa = rewriter
               .create<air::WaitAllOp>(loc, air::AsyncTokenType::get(ctx),
-                                      SmallVector<Value>{})
-              .getAsyncToken());
+                                      SmallVector<Value>{});
+      res.replaceAllUsesWith(
+              yield_wa.getAsyncToken());
+    }
     for (unsigned i = 0; i < herdOp.getNumKernelOperands(); i++)
       herdOp.getKernelArgument(i).replaceAllUsesWith(
           newHerdOp.getKernelArgument(i));
@@ -933,11 +1023,29 @@ struct ConstructPingPongDependencyPattern
 
     // Find ping and pong allocs and deallocs
     SmallVector<Operation *> alloc_execs;
+    // // A vector of pairs made of an async token and a memref value.
+    // std::vector<std::pair<Value, Value>> alloc_tokens_and_memrefs;
     for (auto ia : for_op.getInitArgs()) {
       pushToAllocExecsIfHoistedFromLoop(ia, alloc_execs);
+      // pushToAllocExecsIfHoistedFromLoop(ia, alloc_tokens_and_memrefs);
     }
     if (!alloc_execs.size())
       return failure();
+
+    // // If pingpong target memref isn't produced by memref.alloc.
+    // if (!alloc_tokens_and_memrefs.size()){
+    //   SmallVector<Value> usedMemrefs;
+    //   for_op.getBody()->walk([&](Operation *op) {
+    //     for (auto oper : op->getOperands())
+    //       if (isa<MemRefType>(oper.getType()))
+    //         push_back_if_unique<Value>(usedMemrefs, oper);
+    //   });
+    //   for (auto memref : usedMemrefs){
+    //     auto waOp = rewriter.create<air::WaitAllOp>(for_op->getLoc(), air::AsyncTokenType::get(for_op->getContext()),
+    //                                   SmallVector<Value>{});
+    //     alloc_tokens_and_memrefs.push_back(std::make_pair(waOp.getAsyncToken(), memref));
+    //   }
+    // }
 
     SmallVector<Operation *> dealloc_execs;
     for (auto alloc_exec : alloc_execs) {
@@ -948,12 +1056,23 @@ struct ConstructPingPongDependencyPattern
         }
       }
     }
+    // for (auto pair : alloc_tokens_and_memrefs) {
+    //   auto buffer_memref = pair.second;
+    //   for (auto user : buffer_memref.getUsers()) {
+    //     if (isa<memref::DeallocOp>(user) &&
+    //         isa<air::ExecuteOp>(user->getParentOp())) {
+    //       dealloc_execs.push_back(user->getParentOp());
+    //     }
+    //   }
+    // }
 
     // Find producer and consumer ops that use ping and pong buffers
     SmallVector<std::pair<SmallVector<Operation *>, SmallVector<Operation *>>>
         all_buffers_user_ops;
     for (auto alloc_exec : alloc_execs) {
       auto buffer_memref = alloc_exec->getResult(1);
+    // for (auto pair : alloc_tokens_and_memrefs) {
+    //   auto buffer_memref = pair.second;
       SmallVector<Operation *> producer_ops;
       SmallVector<Operation *> consumer_ops;
       SmallVector<Operation *> candidate_ops;
@@ -1315,6 +1434,19 @@ private:
       }
     }
   }
+  // void pushToAllocExecsIfHoistedFromLoop(
+  //     Value v, std::vector<std::pair<Value, Value>> &alloc_tokens_and_memrefs) const {
+  //   if (auto exec = v.getDefiningOp<air::ExecuteOp>()) {
+  //     if (exec->hasAttr("unrolled_iteration") && exec->getNumResults() == 2 &&
+  //         llvm::isa<MemRefType>(exec->getResult(1).getType())) {
+  //       // alloc_execs.push_back(exec.getOperation());
+  //       alloc_tokens_and_memrefs.push_back(std::make_pair(exec->getResult(0), exec->getResult(1)));
+  //       for (auto dep : exec.getAsyncDependencies()) {
+  //         pushToAllocExecsIfHoistedFromLoop(dep, alloc_tokens_and_memrefs);
+  //       }
+  //     }
+  //   }
+  // }
 };
 
 struct EnforceLoopCarriedMemrefDeallocPattern
