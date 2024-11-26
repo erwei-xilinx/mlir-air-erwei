@@ -1491,6 +1491,19 @@ void AIRSplitL2MemrefForBufferConstraintPass::runOnOperation() {
     }
   };
 
+  // // Get the other chan ops before channel fusion.
+  // auto getTheOtherChannelOpPreFusionThroughSymbol = [](air::ChannelPutOp
+  // putOp, StringAttr pre_fusion_channame){
+  //   SmallVector<air::ChannelInterface> outputs;
+  //   auto theOtherChanOps = air::getTheOtherChannelOpThroughSymbol(putOp);
+  //   for (auto o : theOtherChanOps){
+  //     if (!o->hasAttr("pre-fusion-channame")) continue;
+  //     auto o_pre_fus_name =
+  //     o->getAttrOfType<StringAttr>("pre-fusion-channame"); if (o_pre_fus_name
+  //     == pre_fusion_channame)
+  //   }
+  // };
+
   // Tile memrefs.
   llvm::SmallSet<Operation *, 1> erased;
   for (auto allocOp : targetMemrefs) {
@@ -1571,17 +1584,30 @@ void AIRSplitL2MemrefForBufferConstraintPass::runOnOperation() {
         old_token.replaceAllUsesWith(newWaitAll);
 
         // Update the other channel op of the chanUserChannelDeclr.
-        auto theOtherChanOp =
+        auto theOtherChanOps =
             air::getTheOtherChannelOpThroughSymbol(chanUserOp);
+        air::ChannelInterface theOtherChanOp = theOtherChanOps[0];
+        if (auto pre_fus_channame =
+                chanUserOp->getAttrOfType<StringAttr>("pre-fusion-channame"))
+          for (auto o : theOtherChanOps) {
+            auto o_pre_fus_channame =
+                o->getAttrOfType<StringAttr>("pre-fusion-channame");
+            if (!o_pre_fus_channame)
+              continue;
+            if (o_pre_fus_channame == pre_fus_channame) {
+              theOtherChanOp = o;
+              break;
+            }
+          }
 
         // Account for cases where rank reduction results from at least
         // of the dimensions being equal to one.
-        SmallVector<Value> wraps = theOtherChanOp[0].getSizes();
+        SmallVector<Value> wraps = theOtherChanOp.getSizes();
         if (wraps.empty()) {
           // Populate default wraps, if wraps is an empty vector.
           SmallVector<Value> offsets, strides;
           air::populateDefaultWrapsAndStrides(
-              builder, theOtherChanOp[0].getMemref(), offsets, wraps, strides);
+              builder, theOtherChanOp.getMemref(), offsets, wraps, strides);
         }
         auto adjustedDimIdx = dim;
         if (wraps.size() != memrefShape.size()) {
@@ -1600,14 +1626,14 @@ void AIRSplitL2MemrefForBufferConstraintPass::runOnOperation() {
           }
           if (numSingletonDimDiff == (int)(wraps.size() - memrefShape.size())) {
             // Detected rank reduction (reducing singleton dimensions) between
-            // thisChanOp and theOtherChanOp.
+            // thisChanOp and theOtherChanOps.
 
             // Now let's figure out number of rank-reducing dimensions (of size
             // 1) before 'dim' to compute the appropriate index into
             // wraps/offsets/strides of the channel op on the other side of the
             // segment.
             auto otherShape =
-                air::getTensorShape(theOtherChanOp[0].getMemref().getType());
+                air::getTensorShape(theOtherChanOp.getMemref().getType());
             auto orgDim = 0;
             auto wrapIdx = 0;
             // The dimension index is computed below
@@ -1646,23 +1672,23 @@ void AIRSplitL2MemrefForBufferConstraintPass::runOnOperation() {
         }
 
         if (adjustedDimIdx >= (int)wraps.size()) {
-          theOtherChanOp[0]->emitOpError(
+          theOtherChanOp->emitOpError(
               "Failed to split data access pattern due to air.channel op "
               "having mismatching wraps rank.");
           return;
         }
 
         Value newWaitAll1 =
-            tileChannelOpByFactor(theOtherChanOp[0], targetColTilingFactor,
+            tileChannelOpByFactor(theOtherChanOp, targetColTilingFactor,
                                   *getConstantIntValue(wraps[adjustedDimIdx]),
                                   adjustedDimIdx, allocOp, new_chan, loc, ctx);
 
         // Update dependency.
         auto oldToken =
-            dyn_cast<air::AsyncOpInterface>(theOtherChanOp[0].getOperation())
+            dyn_cast<air::AsyncOpInterface>(theOtherChanOp.getOperation())
                 .getAsyncToken();
         oldToken.replaceAllUsesWith(newWaitAll1);
-        erased.insert(theOtherChanOp[0]);
+        erased.insert(theOtherChanOp);
         erased.insert(chanUserOp);
       }
     }
