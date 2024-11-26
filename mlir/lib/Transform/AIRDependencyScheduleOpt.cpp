@@ -3432,15 +3432,30 @@ public:
     init_options();
     if (channelOps.empty())
       return;
+    // Log symbol names
+    auto logSymbol = [](Operation *symOp) {
+      // Attribute "pre-fusion-channame" keeps tracks of their legacy channel
+      // names.
+      auto symUseRange = mlir::SymbolTable::getSymbolUses(
+          symOp, symOp->getParentOfType<ModuleOp>());
+      if (!symUseRange)
+        return;
+      for (auto symUse : *symUseRange) {
+        symUse.getUser()->setAttr(
+            "pre-fusion-channame",
+            symOp->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName()));
+      }
+    };
     // Rename symbols
     // TODO: make this greedy
     auto renameSymbols =
-        [](std::vector<air::ChannelOp> &channelOps,
-           std::map<air::ChannelOp, air::ChannelOp> chan_merge_map) {
+        [logSymbol](std::vector<air::ChannelOp> &channelOps,
+                    std::map<air::ChannelOp, air::ChannelOp> chan_merge_map) {
           for (unsigned i = 0; i < channelOps.size(); i++) {
             for (auto chanKey : channelOps) {
               if (!chan_merge_map.count(chanKey))
                 continue;
+              logSymbol(chanKey.getOperation());
               auto error = mlir::SymbolTable::replaceAllSymbolUses(
                   chanKey.getOperation(),
                   mlir::SymbolTable::getSymbolName(chan_merge_map[chanKey]),
