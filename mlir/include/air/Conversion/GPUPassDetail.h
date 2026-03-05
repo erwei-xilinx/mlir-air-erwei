@@ -25,6 +25,7 @@ using namespace mlir;
 #define GEN_PASS_DECL
 #define GEN_PASS_DEF_CONVERTAIRTOROCDL
 #define GEN_PASS_DEF_CONVERTGPUKERNELOUTLINE
+#define GEN_PASS_DEF_CONVERTAIRTOASTER
 #include "air/Conversion/GPUPasses.h.inc"
 
 } // namespace air

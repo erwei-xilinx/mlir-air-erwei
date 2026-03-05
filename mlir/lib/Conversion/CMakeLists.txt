@@ -56,6 +56,7 @@ if(AIR_ENABLE_GPU)
   list(APPEND CONVERSION_SOURCES
     AIRToROCDLPass.cpp
     GPUKernelOutlinePass.cpp
+    AIRToAsterPass.cpp
   )
   list(APPEND CONVERSION_LINK_LIBS
     MLIRGPUDialect
