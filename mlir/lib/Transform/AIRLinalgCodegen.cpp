@@ -26,6 +26,7 @@
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
@@ -5279,6 +5280,52 @@ void transform::HoistCastPairOp::getEffects(
   onlyReadsHandle(getLoopOpMutable(), effects);
   producesHandle(getOperation()->getOpResults(), effects);
   modifiesPayload(effects);
+}
+
+//===----------------------------------------------------------------------===//
+// FoldUnitExtentDimsOp
+//===----------------------------------------------------------------------===//
+
+DiagnosedSilenceableFailure
+transform::FoldUnitExtentDimsOp::apply(transform::TransformRewriter &rewriter,
+                                       transform::TransformResults &results,
+                                       transform::TransformState &state) {
+
+  SmallVector<Operation *> targets =
+      llvm::to_vector(state.getPayloadOps(getTarget()));
+
+  SmallVector<Operation *> transformedOps;
+  for (Operation *target : targets) {
+    auto funcOp = dyn_cast_if_present<func::FuncOp>(target);
+    if (!funcOp)
+      return emitDefiniteFailure() << "target must be a func.func operation";
+
+    MLIRContext *ctx = funcOp.getContext();
+    RewritePatternSet patterns(ctx);
+
+    // Populate fold unit extent dims patterns (via reshapes) along with
+    // canonicalization patterns from all registered dialects.
+    linalg::ControlDropUnitDims options;
+    linalg::populateFoldUnitExtentDimsPatterns(patterns, options);
+    linalg::populateLinalgTilingCanonicalizationPatterns(patterns);
+    scf::populateSCFForLoopCanonicalizationPatterns(patterns);
+    memref::populateFoldMemRefAliasOpPatterns(patterns);
+    for (auto *dialect : ctx->getLoadedDialects())
+      dialect->getCanonicalizationPatterns(patterns);
+    for (auto op : ctx->getRegisteredOperations())
+      op.getCanonicalizationPatterns(patterns, ctx);
+
+    // The default GreedyRewriteConfig uses maxIterations=10, matching
+    // LLVM's default. The fold patterns may not fully converge on IR with
+    // air.herd ops containing unit-extent memref dims in LLVM 23.
+    // Ignore non-convergence; partial results are preserved in-place.
+    (void)applyPatternsGreedily(funcOp, std::move(patterns));
+
+    transformedOps.push_back(funcOp);
+  }
+
+  results.set(llvm::cast<OpResult>(getResult()), transformedOps);
+  return DiagnosedSilenceableFailure::success();
 }
 
 //===----------------------------------------------------------------------===//
