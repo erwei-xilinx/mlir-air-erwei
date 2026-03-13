@@ -4752,8 +4752,8 @@ public:
     auto padBeforeAttr = ndcpy->getAttrOfType<DenseI32ArrayAttr>("pad_before");
     auto padAfterAttr = ndcpy->getAttrOfType<DenseI32ArrayAttr>("pad_after");
     if (padBeforeAttr && padAfterAttr) {
-      auto padBefore = padBeforeAttr.asArrayRef();
-      auto padAfter = padAfterAttr.asArrayRef();
+      SmallVector<int32_t> padBefore(padBeforeAttr.asArrayRef());
+      SmallVector<int32_t> padAfter(padAfterAttr.asArrayRef());
 
       // If sizes/strides were canonicalized away (empty), reconstruct them
       // from the memref shape to match padding dimensionality.
@@ -4784,8 +4784,8 @@ public:
                 arith::ConstantIndexOp::create(b, memcpyOp.getLoc(), 1)
                     ->getResult(0));
             // Reduce padding to 1D to match
-            padBefore = padBefore.take_back(1);
-            padAfter = padAfter.take_back(1);
+            padBefore = {padBefore.back()};
+            padAfter = {padAfter.back()};
           } else if (shape.size() == padBefore.size()) {
             // N-D memref matches padding dims. Reconstruct default
             // sizes/strides
@@ -4813,6 +4813,31 @@ public:
           wraps_and_strides = AIE::BDDimLayoutArrayAttr::get(
               ndcpy->getContext(), ArrayRef(dims));
         }
+      }
+
+      // Strip unit dimensions (size=1 with zero padding) to save BD slots.
+      {
+        SmallVector<Value> ns, nt;
+        SmallVector<int32_t> npb, npa;
+        for (size_t i = 0; i < sizes.size(); i++) {
+          auto sv = getConstantIntValue(sizes[i]);
+          if (sv && *sv == 1 && i < padBefore.size() && padBefore[i] == 0 &&
+              padAfter[i] == 0)
+            continue;
+          ns.push_back(sizes[i]);
+          nt.push_back(strides[i]);
+          if (i < padBefore.size()) {
+            npb.push_back(padBefore[i]);
+            npa.push_back(padAfter[i]);
+          }
+        }
+        sizes = ns;
+        strides = nt;
+        padBefore = npb;
+        padAfter = npa;
+        dims = air::getWrapsAndStrides(sizes, strides, ndcpy->getContext());
+        wraps_and_strides =
+            AIE::BDDimLayoutArrayAttr::get(ndcpy->getContext(), ArrayRef(dims));
       }
 
       // Validate padding rank matches sizes rank.

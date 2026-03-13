@@ -2093,6 +2093,14 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
     Value memref = allocOp.getMemref();
     if (auto exec = dyn_cast_if_present<air::ExecuteOp>(allocOp->getParentOp()))
       memref = exec->getResult(1);
+    // Skip L2 buffers accessed by padded channel ops.
+    bool hasPaddedUser = llvm::any_of(memref.getUsers(), [](Operation *user) {
+      if (auto ch = dyn_cast<air::ChannelInterface>(user))
+        return ch->getAttrOfType<DenseI32ArrayAttr>("pad_before") != nullptr;
+      return false;
+    });
+    if (hasPaddedUser)
+      continue;
     // Maps of MM2S and S2MM channels and their sub-channels.
     llvm::MapVector<air::ChannelOp, SmallVector<SmallVector<Value>>>
         MM2SChannels, S2MMChannels;

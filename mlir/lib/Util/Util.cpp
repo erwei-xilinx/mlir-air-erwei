@@ -1422,6 +1422,39 @@ void air::copyPaddingAttributes(Operation *src, Operation *dst) {
     dst->setAttr("pad_after", padAfter);
 }
 
+void air::syncPaddingRankWithSizes(Operation *op, size_t sizesRank) {
+  auto padBefore = op->getAttrOfType<DenseI32ArrayAttr>("pad_before");
+  auto padAfter = op->getAttrOfType<DenseI32ArrayAttr>("pad_after");
+  if (!padBefore || !padAfter)
+    return;
+  if (padBefore.size() == (int64_t)sizesRank)
+    return; // Already matching.
+  if (padBefore.size() < (int64_t)sizesRank)
+    return; // Cannot expand — unexpected.
+  // Strip leading dimensions where both pad_before and pad_after are zero.
+  SmallVector<int32_t> newPadBefore(padBefore.asArrayRef());
+  SmallVector<int32_t> newPadAfter(padAfter.asArrayRef());
+  while (newPadBefore.size() > (size_t)sizesRank && newPadBefore.front() == 0 &&
+         newPadAfter.front() == 0) {
+    newPadBefore.erase(newPadBefore.begin());
+    newPadAfter.erase(newPadAfter.begin());
+  }
+  // If we still have more padding dims than sizes, strip trailing zeros too.
+  while (newPadBefore.size() > (size_t)sizesRank && newPadBefore.back() == 0 &&
+         newPadAfter.back() == 0) {
+    newPadBefore.pop_back();
+    newPadAfter.pop_back();
+  }
+  if (newPadBefore.size() == (size_t)sizesRank) {
+    op->setAttr("pad_before",
+                DenseI32ArrayAttr::get(op->getContext(), newPadBefore));
+    op->setAttr("pad_after",
+                DenseI32ArrayAttr::get(op->getContext(), newPadAfter));
+  }
+  // If we can't match the rank (non-zero padding on removed dims), leave
+  // unchanged — the verifier will catch the mismatch.
+}
+
 // Check if the wraps and strides imply the default (contiguous, row-major) data
 // access pattern.
 bool air::isDefaultDataAccessPattern(SmallVector<Value> memcpy_sizes,

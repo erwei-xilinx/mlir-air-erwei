@@ -208,6 +208,9 @@ void populateDefaultWrapsAndStrides(OpBuilder builder, Value memref,
 // another. These are inherent ODS attributes and are not included in the
 // discardable attr dictionary, so they must be copied explicitly.
 void copyPaddingAttributes(Operation *src, Operation *dst);
+// Synchronize padding attribute rank with sizes rank by stripping leading
+// zero-padding dimensions. Called after canonicalization reduces sizes rank.
+void syncPaddingRankWithSizes(Operation *op, size_t sizesRank);
 
 // Check if the wraps and strides imply the default (contiguous, row-major) data
 // access pattern.

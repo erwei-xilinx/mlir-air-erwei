@@ -2052,6 +2052,10 @@ struct AIRSpecializeChannelWrapAndStrideInScfFor
     air::ChannelInterface channel_op =
         *(for_op.getBody()->getOps<air::ChannelInterface>().begin());
 
+    // Skip for-loop absorption when padding is present.
+    if (channel_op->getAttrOfType<DenseI32ArrayAttr>("pad_before"))
+      return failure();
+
     // Fold for loops into channel op's wrap and stride fields
     SmallVector<Value> offsets = channel_op.getOffsets();
     SmallVector<Value> wraps = channel_op.getSizes();
@@ -2189,6 +2193,9 @@ struct AIRSpecializeChannelWrapAndStrideInScfFor
           /*pad_before=*/nullptr, /*pad_after=*/nullptr);
     new_chan_op->setAttrs(channel_op->getDiscardableAttrDictionary());
     air::copyPaddingAttributes(channel_op, new_chan_op);
+    // Synchronize padding rank with sizes rank after canonicalization.
+    // Strip leading zero-padding dimensions to match.
+    air::syncPaddingRankWithSizes(new_chan_op, wraps.size());
 
     // Clear all external uses of for_op before erasing it.
     for (auto res : for_op.getResults()) {
@@ -2240,6 +2247,12 @@ struct AIRUnrollScfForIntoBDChain : public OpRewritePattern<scf::ForOp> {
 
     if (!containsOnlyAIRChannels(for_op.getBody()))
       return failure();
+
+    // Skip unrolling for-loops containing padded channel ops.
+    for (auto &o : for_op.getBody()->getOperations())
+      if (auto ch = dyn_cast<air::ChannelInterface>(o))
+        if (ch->getAttrOfType<DenseI32ArrayAttr>("pad_before"))
+          return failure();
 
     // Check if the loop is ping-pong buffered. Ping-pong buffered loop's body
     // already forms a bd chain.
@@ -2385,6 +2398,7 @@ struct AIRSpecializeChannelWrapAndStrideInAffineFor
           /*pad_before=*/nullptr, /*pad_after=*/nullptr);
     new_chan_op->setAttrs(channel_op->getDiscardableAttrDictionary());
     air::copyPaddingAttributes(channel_op, new_chan_op);
+    air::syncPaddingRankWithSizes(new_chan_op, wraps.size());
 
     for (auto res : for_op.getResults()) {
       if (isa<air::AsyncTokenType>(res.getType())) {
@@ -2503,6 +2517,7 @@ struct AIRCanonicalizeChannelPutGetOpWrapAndStrideList
         offsets, sizes, strides,
         /*pad_before=*/padBefore, /*pad_after=*/padAfter);
     new_op->setAttrs(attrs);
+    air::syncPaddingRankWithSizes(new_op, sizes.size());
 
     return success();
   }
@@ -2665,6 +2680,7 @@ private:
                             op.getChanName(), new_channel_idx, op.getMemref(),
                             new_offsets, new_sizes, new_strides,
                             /*pad_before=*/padBefore, /*pad_after=*/padAfter);
+    air::syncPaddingRankWithSizes(new_op, new_sizes.size());
 
     // Create scf::ReduceOp
     air::createSCFReduceForAsyncSCFParallel(
