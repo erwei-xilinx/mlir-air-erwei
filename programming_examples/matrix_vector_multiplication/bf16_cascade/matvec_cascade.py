@@ -354,7 +354,9 @@ def build_module(
                                     sub_b = subview(_l1_b, [j_k], [vec_size], [1])
 
                                     # Map (d0, d1) -> (d1) to read along the k dimension
-                                    read_map_2d = AffineMap.get(2, 0, [AffineExpr.get_dim(1)])
+                                    read_map_2d = AffineMap.get(
+                                        2, 0, [AffineExpr.get_dim(1)]
+                                    )
                                     v_a = transfer_read(
                                         vecTy_bf16,
                                         sub_a,
@@ -451,11 +453,15 @@ def build_module(
                                         )
                                         sub_b = subview(_l1_b, [j_k], [vec_size], [1])
 
+                                        # Map (d0, d1) -> (d1) to read along the k dimension
+                                        read_map_2d = AffineMap.get(
+                                            2, 0, [AffineExpr.get_dim(1)]
+                                        )
                                         v_a = transfer_read(
                                             vecTy_bf16,
                                             sub_a,
-                                            [c0],
-                                            identity_map,
+                                            [c0, c0],
+                                            read_map_2d,
                                             cst0_bf16,
                                             [True],
                                         )
@@ -563,11 +569,15 @@ def build_module(
                                         )
                                         sub_b = subview(_l1_b, [j_k], [vec_size], [1])
 
+                                        # Map (d0, d1) -> (d1) to read along the k dimension
+                                        read_map_2d = AffineMap.get(
+                                            2, 0, [AffineExpr.get_dim(1)]
+                                        )
                                         v_a = transfer_read(
                                             vecTy_bf16,
                                             sub_a,
-                                            [c0],
-                                            identity_map,
+                                            [c0, c0],
+                                            read_map_2d,
                                             cst0_bf16,
                                             [True],
                                         )
