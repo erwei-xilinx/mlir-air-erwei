@@ -28,9 +28,22 @@ from air.dialects.affine import apply as affine_apply
 from air.dialects.air import *
 from air.dialects import arith, scf
 from air.dialects.arith import ConstantOp
-from air.dialects.memref import AllocOp, DeallocOp
-from air.dialects.func import FuncOp, CallOp
+from air.dialects.memref import (
+    AllocOp,
+    DeallocOp,
+    subview,
+    load as memref_load,
+    store as memref_store,
+)
+from air.dialects.func import FuncOp
 from air.dialects.scf import for_, yield_
+from air.dialects.vector import (
+    transfer_read,
+    transfer_write,
+    BroadcastOp,
+    reduction as vector_reduction,
+    fma,
+)
 from air.backend.xrt_runner import XRTRunner, type_mapper
 from air.backend.xrt import XRTBackend
 
@@ -132,63 +145,6 @@ def build_module(
     # Cascade channel: per-column cascade links.
     # n_cascade tiles per column → n_cascade-1 links per column.
     channel("chan_cascade", size=[herd_cols, n_cascade - 1], channel_type="cascade")
-
-    # External kernel declarations.
-    # First tile: compute partial sums → scratch
-    matvec_first_func = FuncOp(
-        "matvec_cascade_first_bf16",
-        (
-            [T.i32(), T.i32(), l1MemrefTyA, l1MemrefTyB, l1MemrefTyScratch],
-            [],
-        ),
-        visibility="private",
-    )
-    # Middle tile: recv + own partial → scratch
-    matvec_middle_func = FuncOp(
-        "matvec_cascade_middle_bf16",
-        (
-            [
-                T.i32(),
-                T.i32(),
-                l1MemrefTyA,
-                l1MemrefTyB,
-                l1MemrefTyScratch,  # recv (incoming partial sums)
-                l1MemrefTyScratch,  # scratch (output partial sums)
-            ],
-            [],
-        ),
-        visibility="private",
-    )
-    # Last tile: recv + own partial → bf16 output
-    matvec_last_func = FuncOp(
-        "matvec_cascade_last_bf16",
-        (
-            [
-                T.i32(),
-                T.i32(),
-                T.i32(),
-                l1MemrefTyA,
-                l1MemrefTyB,
-                l1MemrefTyScratch,  # recv (incoming partial sums)
-                l1MemrefTyC,
-            ],
-            [],
-        ),
-        visibility="private",
-    )
-    linalg_fill_func = FuncOp(
-        "linalg_fill_bf16",
-        ([xrt_dtype_out, l1MemrefTyC], []),
-        visibility="private",
-    )
-    for func in [
-        matvec_first_func,
-        matvec_middle_func,
-        matvec_last_func,
-        linalg_fill_func,
-    ]:
-        func.attributes["link_with"] = StringAttr.get("mv_cascade.o")
-        func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
 
     @FuncOp.from_py_func(memrefTyA, memrefTyB, memrefTyC)
     def matvec_cascade_bf16(arg0, arg1, arg2):
@@ -308,11 +264,28 @@ def build_module(
                     )
 
                     # Zero-fill output buffer (only used by last tile)
+                    # Inline vector-based zero fill
                     cmp_is_last = arith.CmpIOp(arith.CmpIPredicate.eq, ty, c0)
                     if_zero_fill = scf.IfOp(cmp_is_last)
                     with InsertionPoint(if_zero_fill.then_block):
-                        zero = ConstantOp(FloatAttr.get(xrt_dtype_out, 0), None)
-                        CallOp(linalg_fill_func, [zero, _l1_c])
+                        zero = ConstantOp(FloatAttr.get(xrt_dtype_out, 0.0), None)
+                        # Vector size for bf16: 32 elements (512 bits / 16 bits per bf16)
+                        vec_size_bf16 = 32
+                        vecTy_bf16 = VectorType.get([vec_size_bf16], xrt_dtype_out)
+                        v_zero_bf16 = BroadcastOp(vecTy_bf16, zero)
+                        identity_map = AffineMap.get_identity(1)
+                        # Write zero vectors across the entire output buffer
+                        for i_fill in range_(0, tile_m, vec_size_bf16):
+                            sub_c_fill = subview(_l1_c, [i_fill], [vec_size_bf16], [1])
+                            transfer_write(
+                                None,
+                                v_zero_bf16,
+                                sub_c_fill,
+                                [c0],
+                                identity_map,
+                                [True],
+                            )
+                            yield_([])
                         yield_([])
 
                     # Loop over m_input rows at a time
@@ -338,17 +311,112 @@ def build_module(
                             src_strides=[tile_m * k, k, 1],
                         )
 
-                        # === Cascade pipeline logic ===
+                        # === Cascade pipeline logic (inline vector implementation) ===
+                        # Vector size for bf16 MAC: 64 elements
+                        vec_size = 64
+                        vecTy_bf16 = VectorType.get([vec_size], xrt_dtype_in)
+                        vecTy_f32 = VectorType.get([vec_size], f32_type)
+                        identity_map = AffineMap.get_identity(1)
+                        cst0_bf16 = arith.ConstantOp(xrt_dtype_in, 0.0)
+                        cst0_f32 = arith.ConstantOp(f32_type, 0.0)
+
+                        # Allocate temp buffer for vector accumulator
+                        l1MemrefTyAccTmp = MemRefType.get(
+                            shape=[vec_size],
+                            element_type=f32_type,
+                            memory_space=l1_mem_space,
+                        )
+                        l1_acc_tmp = AllocOp(l1MemrefTyAccTmp, [], [])
 
                         # First tile (ty == n_cascade-1): compute → cascade put
                         cmp_first = arith.CmpIOp(arith.CmpIPredicate.eq, ty, last_ty)
                         if_first = scf.IfOp(cmp_first, has_else=True)
                         with InsertionPoint(if_first.then_block):
-                            CallOp(
-                                matvec_first_func,
-                                [m_const, k_chunk_const, _l1_a, _l1_b, _l1_scratch],
-                            )
-                            # Send scratch via cascade channel.
+                            # Compute partial dot products for m_input rows
+                            for row in range_(0, m_input):
+                                # Initialize accumulator to zero
+                                zero_vec_f32 = BroadcastOp(vecTy_f32, cst0_f32)
+                                transfer_write(
+                                    None,
+                                    zero_vec_f32,
+                                    l1_acc_tmp,
+                                    [c0],
+                                    identity_map,
+                                    [True],
+                                )
+
+                                # Vectorized dot product over k_chunk
+                                for j_k in range_(0, k_chunk, vec_size):
+                                    # Subview of A: [row, j_k:j_k+vec_size]
+                                    sub_a = subview(
+                                        _l1_a, [row, j_k], [1, vec_size], [1, 1]
+                                    )
+                                    sub_b = subview(_l1_b, [j_k], [vec_size], [1])
+
+                                    # Map (d0, d1) -> (d1) to read along the k dimension
+                                    read_map_2d = AffineMap.get(2, 0, [AffineExpr.get_dim(1)])
+                                    v_a = transfer_read(
+                                        vecTy_bf16,
+                                        sub_a,
+                                        [c0, c0],
+                                        read_map_2d,
+                                        cst0_bf16,
+                                        [True],
+                                    )
+                                    v_b = transfer_read(
+                                        vecTy_bf16,
+                                        sub_b,
+                                        [c0],
+                                        identity_map,
+                                        cst0_bf16,
+                                        [True],
+                                    )
+
+                                    # Extend bf16 to f32 for accumulation
+                                    v_a_f32 = arith.extf(vecTy_f32, v_a)
+                                    v_b_f32 = arith.extf(vecTy_f32, v_b)
+
+                                    # Read current accumulator
+                                    v_acc = transfer_read(
+                                        vecTy_f32,
+                                        l1_acc_tmp,
+                                        [c0],
+                                        identity_map,
+                                        cst0_f32,
+                                        [True],
+                                    )
+
+                                    # FMA: acc = a * b + acc
+                                    v_result = fma(v_a_f32, v_b_f32, v_acc)
+
+                                    # Write back to temp buffer
+                                    transfer_write(
+                                        None,
+                                        v_result,
+                                        l1_acc_tmp,
+                                        [c0],
+                                        identity_map,
+                                        [True],
+                                    )
+                                    yield_([])
+
+                                # Horizontal reduction to scalar
+                                v_final = transfer_read(
+                                    vecTy_f32,
+                                    l1_acc_tmp,
+                                    [c0],
+                                    identity_map,
+                                    cst0_f32,
+                                    [True],
+                                )
+                                partial_sum = vector_reduction(f32_type, "add", v_final)
+
+                                # Write to scratch buffer
+                                sub_scratch = subview(_l1_scratch, [row], [1], [1])
+                                memref_store(partial_sum, sub_scratch, [c0])
+                                yield_([])
+
+                            # Send scratch via cascade channel
                             prev_ty = arith.SubIOp(ty, c1_idx)
                             ChannelPut(
                                 "chan_cascade", _l1_scratch, indices=[tx, prev_ty]
@@ -361,35 +429,210 @@ def build_module(
                             if_last = scf.IfOp(cmp_last, has_else=True)
                             with InsertionPoint(if_last.then_block):
                                 ChannelGet("chan_cascade", _l1_recv, indices=[tx, ty])
-                                row_offset_i32 = arith.index_cast(T.i32(), j_m_offset)
-                                CallOp(
-                                    matvec_last_func,
-                                    [
-                                        m_const,
-                                        k_chunk_const,
-                                        row_offset_i32,
-                                        _l1_a,
-                                        _l1_b,
-                                        _l1_recv,
-                                        _l1_c,
-                                    ],
-                                )
+
+                                # Compute partial dot + add recv + write to output
+                                for row in range_(0, m_input):
+                                    # Initialize accumulator to zero
+                                    zero_vec_f32 = BroadcastOp(vecTy_f32, cst0_f32)
+                                    transfer_write(
+                                        None,
+                                        zero_vec_f32,
+                                        l1_acc_tmp,
+                                        [c0],
+                                        identity_map,
+                                        [True],
+                                    )
+
+                                    # Vectorized dot product over k_chunk
+                                    for j_k in range_(0, k_chunk, vec_size):
+                                        # Subview of A: [row, j_k:j_k+vec_size]
+                                        sub_a = subview(
+                                            _l1_a, [row, j_k], [1, vec_size], [1, 1]
+                                        )
+                                        sub_b = subview(_l1_b, [j_k], [vec_size], [1])
+
+                                        v_a = transfer_read(
+                                            vecTy_bf16,
+                                            sub_a,
+                                            [c0],
+                                            identity_map,
+                                            cst0_bf16,
+                                            [True],
+                                        )
+                                        v_b = transfer_read(
+                                            vecTy_bf16,
+                                            sub_b,
+                                            [c0],
+                                            identity_map,
+                                            cst0_bf16,
+                                            [True],
+                                        )
+
+                                        v_a_f32 = arith.extf(vecTy_f32, v_a)
+                                        v_b_f32 = arith.extf(vecTy_f32, v_b)
+
+                                        # Read current accumulator
+                                        v_acc = transfer_read(
+                                            vecTy_f32,
+                                            l1_acc_tmp,
+                                            [c0],
+                                            identity_map,
+                                            cst0_f32,
+                                            [True],
+                                        )
+
+                                        # FMA
+                                        v_result = fma(v_a_f32, v_b_f32, v_acc)
+
+                                        # Write back
+                                        transfer_write(
+                                            None,
+                                            v_result,
+                                            l1_acc_tmp,
+                                            [c0],
+                                            identity_map,
+                                            [True],
+                                        )
+                                        yield_([])
+
+                                    # Horizontal reduction to scalar
+                                    v_final = transfer_read(
+                                        vecTy_f32,
+                                        l1_acc_tmp,
+                                        [c0],
+                                        identity_map,
+                                        cst0_f32,
+                                        [True],
+                                    )
+                                    partial_sum = vector_reduction(
+                                        f32_type, "add", v_final
+                                    )
+
+                                    # Load received upstream partial sum
+                                    sub_recv = subview(_l1_recv, [row], [1], [1])
+                                    recv_val = memref_load(sub_recv, [c0])
+
+                                    # Add partial sums
+                                    total = arith.addf(recv_val, partial_sum)
+
+                                    # Convert f32 to bf16
+                                    total_bf16 = arith.truncf(xrt_dtype_out, total)
+
+                                    # Write to output buffer at j_m_offset + row
+                                    row_out_map = AffineMap.get(
+                                        0,
+                                        2,
+                                        [
+                                            AffineExpr.get_add(
+                                                AffineSymbolExpr.get(0),
+                                                AffineSymbolExpr.get(1),
+                                            )
+                                        ],
+                                    )
+                                    out_idx = affine_apply(
+                                        row_out_map, [j_m_offset, row]
+                                    )
+                                    sub_c_out = subview(_l1_c, [out_idx], [1], [1])
+                                    memref_store(total_bf16, sub_c_out, [c0])
+                                    yield_([])
+
                                 yield_([])
 
                             with InsertionPoint(if_last.else_block):
                                 # Middle tiles: cascade get → compute → cascade put
                                 ChannelGet("chan_cascade", _l1_recv, indices=[tx, ty])
-                                CallOp(
-                                    matvec_middle_func,
-                                    [
-                                        m_const,
-                                        k_chunk_const,
-                                        _l1_a,
-                                        _l1_b,
-                                        _l1_recv,
-                                        _l1_scratch,
-                                    ],
-                                )
+
+                                # Compute partial dot + add recv + write to scratch
+                                for row in range_(0, m_input):
+                                    # Initialize accumulator to zero
+                                    zero_vec_f32 = BroadcastOp(vecTy_f32, cst0_f32)
+                                    transfer_write(
+                                        None,
+                                        zero_vec_f32,
+                                        l1_acc_tmp,
+                                        [c0],
+                                        identity_map,
+                                        [True],
+                                    )
+
+                                    # Vectorized dot product over k_chunk
+                                    for j_k in range_(0, k_chunk, vec_size):
+                                        # Subview of A: [row, j_k:j_k+vec_size]
+                                        sub_a = subview(
+                                            _l1_a, [row, j_k], [1, vec_size], [1, 1]
+                                        )
+                                        sub_b = subview(_l1_b, [j_k], [vec_size], [1])
+
+                                        v_a = transfer_read(
+                                            vecTy_bf16,
+                                            sub_a,
+                                            [c0],
+                                            identity_map,
+                                            cst0_bf16,
+                                            [True],
+                                        )
+                                        v_b = transfer_read(
+                                            vecTy_bf16,
+                                            sub_b,
+                                            [c0],
+                                            identity_map,
+                                            cst0_bf16,
+                                            [True],
+                                        )
+
+                                        v_a_f32 = arith.extf(vecTy_f32, v_a)
+                                        v_b_f32 = arith.extf(vecTy_f32, v_b)
+
+                                        # Read current accumulator
+                                        v_acc = transfer_read(
+                                            vecTy_f32,
+                                            l1_acc_tmp,
+                                            [c0],
+                                            identity_map,
+                                            cst0_f32,
+                                            [True],
+                                        )
+
+                                        # FMA
+                                        v_result = fma(v_a_f32, v_b_f32, v_acc)
+
+                                        # Write back
+                                        transfer_write(
+                                            None,
+                                            v_result,
+                                            l1_acc_tmp,
+                                            [c0],
+                                            identity_map,
+                                            [True],
+                                        )
+                                        yield_([])
+
+                                    # Horizontal reduction to scalar
+                                    v_final = transfer_read(
+                                        vecTy_f32,
+                                        l1_acc_tmp,
+                                        [c0],
+                                        identity_map,
+                                        cst0_f32,
+                                        [True],
+                                    )
+                                    partial_sum = vector_reduction(
+                                        f32_type, "add", v_final
+                                    )
+
+                                    # Load received upstream partial sum
+                                    sub_recv = subview(_l1_recv, [row], [1], [1])
+                                    recv_val = memref_load(sub_recv, [c0])
+
+                                    # Add partial sums
+                                    total = arith.addf(recv_val, partial_sum)
+
+                                    # Write to scratch buffer
+                                    sub_scratch = subview(_l1_scratch, [row], [1], [1])
+                                    memref_store(total, sub_scratch, [c0])
+                                    yield_([])
+
+                                # Send scratch via cascade channel
                                 prev_ty_mid = arith.SubIOp(ty, c1_idx)
                                 ChannelPut(
                                     "chan_cascade",
@@ -400,6 +643,7 @@ def build_module(
 
                             yield_([])
 
+                        DeallocOp(l1_acc_tmp)
                         yield_([])
 
                     # Only ty==0 tiles write results back: L1→L2
@@ -417,8 +661,6 @@ def build_module(
                             src_strides=[1],
                         )
                         yield_([])
-
-                herd_body.attributes["link_with"] = StringAttr.get("mv_cascade.o")
 
                 # L2→L3: C
                 dma_memcpy_nd(

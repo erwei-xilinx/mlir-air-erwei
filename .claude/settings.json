@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(/home/strixminipc/new_session_2/mlir-air/.majel/**)",
+      "Edit(/home/strixminipc/new_session_2/mlir-air/.majel/**)",
+      "Write(/home/strixminipc/new_session_2/mlir-air/.majel/**)",
+      "Glob(/home/strixminipc/new_session_2/mlir-air/.majel/**)"
+    ]
+  }
+}
