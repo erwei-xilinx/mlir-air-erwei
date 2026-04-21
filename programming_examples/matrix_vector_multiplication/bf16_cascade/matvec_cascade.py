@@ -655,9 +655,6 @@ def build_module(
 
                         yield_([])
 
-                    # Deallocate temp buffer after processing all rows
-                    DeallocOp(l1_acc_tmp)
-
                     # Only ty==0 tiles write results back: L1→L2
                     cmp_writer = arith.CmpIOp(arith.CmpIPredicate.eq, ty, c0)
                     if_writer = scf.IfOp(cmp_writer)
@@ -673,6 +670,9 @@ def build_module(
                             src_strides=[1],
                         )
                         yield_([])
+
+                    # Deallocate temp accumulator buffer
+                    DeallocOp(l1_acc_tmp)
 
                 # L2→L3: C
                 dma_memcpy_nd(
