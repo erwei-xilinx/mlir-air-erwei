@@ -263,43 +263,22 @@ def build_module(
                         src_strides=[1],
                     )
 
-                    # Zero-fill output buffer (only used by last tile)
-                    # Inline vector-based zero fill
-                    cmp_is_last = arith.CmpIOp(arith.CmpIPredicate.eq, ty, c0)
-                    if_zero_fill = scf.IfOp(cmp_is_last)
-                    with InsertionPoint(if_zero_fill.then_block):
-                        zero = ConstantOp(FloatAttr.get(xrt_dtype_out, 0.0), None)
-                        # Vector size for bf16: 32 elements (512 bits / 16 bits per bf16)
-                        vec_size_bf16 = 32
-                        vecTy_bf16 = VectorType.get([vec_size_bf16], xrt_dtype_out)
-                        v_zero_bf16 = BroadcastOp(vecTy_bf16, zero)
-                        identity_map = AffineMap.get_identity(1)
-                        # Write zero vectors across the entire output buffer
-                        for i_fill in range_(0, tile_m, vec_size_bf16):
-                            sub_c_fill = subview(_l1_c, [i_fill], [vec_size_bf16], [1])
-                            transfer_write(
-                                None,
-                                v_zero_bf16,
-                                sub_c_fill,
-                                [c0],
-                                identity_map,
-                                [True],
-                            )
-                            yield_([])
-                        yield_([])
-
                     # === Cascade pipeline logic setup (inline vector implementation) ===
-                    # Vector size for bf16 MAC: 32 elements (512 bits = 32 * 16 bits)
-                    vec_size = 32
-                    vecTy_bf16 = VectorType.get([vec_size], xrt_dtype_in)
+                    # f32 accumulation: 16 f32 = 512 bits (full SIMD width).
+                    # A and B are read as bf16 (16 elements) and extended to f32 before
+                    # FMA to match the precision of accfloat accumulation in the
+                    # external kernel reference.
+                    f32_vec_size = 16
+                    vecTy_bf16 = VectorType.get([f32_vec_size], xrt_dtype_in)
+                    vecTy_f32 = VectorType.get([f32_vec_size], f32_type)
                     identity_map = AffineMap.get_identity(1)
                     cst0_bf16 = arith.ConstantOp(xrt_dtype_in, 0.0)
                     cst0_f32 = arith.ConstantOp(f32_type, 0.0)
 
-                    # Allocate temp buffer for bf16 vector accumulator (reused across all rows)
+                    # Allocate temp buffer for f32 vector accumulator (reused across all rows)
                     l1MemrefTyAccTmp = MemRefType.get(
-                        shape=[vec_size],
-                        element_type=xrt_dtype_in,
+                        shape=[f32_vec_size],
+                        element_type=f32_type,
                         memory_space=l1_mem_space,
                     )
                     l1_acc_tmp = AllocOp(l1MemrefTyAccTmp, [], [])
@@ -333,30 +312,31 @@ def build_module(
                         with InsertionPoint(if_first.then_block):
                             # Compute partial dot products for m_input rows
                             for row in range_(0, m_input):
-                                # Initialize bf16 accumulator to zero
-                                zero_vec_bf16 = BroadcastOp(vecTy_bf16, cst0_bf16)
+                                # Initialize f32 accumulator to zero
+                                zero_vec_f32 = BroadcastOp(vecTy_f32, cst0_f32)
                                 transfer_write(
                                     None,
-                                    zero_vec_bf16,
+                                    zero_vec_f32,
                                     l1_acc_tmp,
                                     [c0],
                                     identity_map,
                                     [True],
                                 )
 
-                                # Vectorized dot product over k_chunk
-                                for j_k in range_(0, k_chunk, vec_size):
-                                    # Subview of A: [row, j_k:j_k+vec_size]
+                                # Vectorized dot product: bf16 inputs extended to f32,
+                                # accumulated in f32 for accfloat-equivalent precision.
+                                for j_k in range_(0, k_chunk, f32_vec_size):
+                                    # Subview of A: [row, j_k:j_k+f32_vec_size]
                                     sub_a = subview(
-                                        _l1_a, [row, j_k], [1, vec_size], [1, 1]
+                                        _l1_a, [row, j_k], [1, f32_vec_size], [1, 1]
                                     )
-                                    sub_b = subview(_l1_b, [j_k], [vec_size], [1])
+                                    sub_b = subview(_l1_b, [j_k], [f32_vec_size], [1])
 
                                     # Map (d0, d1) -> (d1) to read along the k dimension
                                     read_map_2d = AffineMap.get(
                                         2, 0, [AffineExpr.get_dim(1)]
                                     )
-                                    v_a = transfer_read(
+                                    v_a_bf16 = transfer_read(
                                         vecTy_bf16,
                                         sub_a,
                                         [c0, c0],
@@ -364,7 +344,7 @@ def build_module(
                                         cst0_bf16,
                                         [True],
                                     )
-                                    v_b = transfer_read(
+                                    v_b_bf16 = transfer_read(
                                         vecTy_bf16,
                                         sub_b,
                                         [c0],
@@ -373,18 +353,22 @@ def build_module(
                                         [True],
                                     )
 
-                                    # Read current bf16 accumulator
+                                    # Extend bf16 to f32 for accfloat-equivalent precision
+                                    v_a_f32 = arith.extf(vecTy_f32, v_a_bf16)
+                                    v_b_f32 = arith.extf(vecTy_f32, v_b_bf16)
+
+                                    # Read current f32 accumulator
                                     v_acc = transfer_read(
-                                        vecTy_bf16,
+                                        vecTy_f32,
                                         l1_acc_tmp,
                                         [c0],
                                         identity_map,
-                                        cst0_bf16,
+                                        cst0_f32,
                                         [True],
                                     )
 
-                                    # FMA: acc = a * b + acc (bf16)
-                                    v_result = fma(v_a, v_b, v_acc)
+                                    # FMA in f32: acc = a * b + acc
+                                    v_result = fma(v_a_f32, v_b_f32, v_acc)
 
                                     # Write back to temp buffer
                                     transfer_write(
@@ -397,23 +381,18 @@ def build_module(
                                     )
                                     yield_([])
 
-                                # Horizontal reduction to bf16 scalar
+                                # Horizontal reduction of f32 accumulator to scalar f32
                                 v_final = transfer_read(
-                                    vecTy_bf16,
+                                    vecTy_f32,
                                     l1_acc_tmp,
                                     [c0],
                                     identity_map,
-                                    cst0_bf16,
+                                    cst0_f32,
                                     [True],
                                 )
-                                partial_sum_bf16 = vector_reduction(
-                                    xrt_dtype_in, "add", v_final
-                                )
+                                partial_sum = vector_reduction(f32_type, "add", v_final)
 
-                                # Extend bf16 scalar to f32 for cascade transfer
-                                partial_sum = arith.extf(f32_type, partial_sum_bf16)
-
-                                # Write to scratch buffer (f32)
+                                # Write to scratch buffer (f32) - already f32, no extf needed
                                 sub_scratch = subview(_l1_scratch, [row], [1], [1])
                                 memref_store(partial_sum, sub_scratch, [c0])
                                 yield_([])
@@ -434,30 +413,35 @@ def build_module(
 
                                 # Compute partial dot + add recv + write to output
                                 for row in range_(0, m_input):
-                                    # Initialize bf16 accumulator to zero
-                                    zero_vec_bf16 = BroadcastOp(vecTy_bf16, cst0_bf16)
+                                    # Initialize f32 accumulator to zero
+                                    zero_vec_f32 = BroadcastOp(vecTy_f32, cst0_f32)
                                     transfer_write(
                                         None,
-                                        zero_vec_bf16,
+                                        zero_vec_f32,
                                         l1_acc_tmp,
                                         [c0],
                                         identity_map,
                                         [True],
                                     )
 
-                                    # Vectorized dot product over k_chunk
-                                    for j_k in range_(0, k_chunk, vec_size):
-                                        # Subview of A: [row, j_k:j_k+vec_size]
+                                    # Vectorized dot product: bf16 inputs → f32 accumulation
+                                    for j_k in range_(0, k_chunk, f32_vec_size):
+                                        # Subview of A: [row, j_k:j_k+f32_vec_size]
                                         sub_a = subview(
-                                            _l1_a, [row, j_k], [1, vec_size], [1, 1]
+                                            _l1_a,
+                                            [row, j_k],
+                                            [1, f32_vec_size],
+                                            [1, 1],
                                         )
-                                        sub_b = subview(_l1_b, [j_k], [vec_size], [1])
+                                        sub_b = subview(
+                                            _l1_b, [j_k], [f32_vec_size], [1]
+                                        )
 
                                         # Map (d0, d1) -> (d1) to read along the k dimension
                                         read_map_2d = AffineMap.get(
                                             2, 0, [AffineExpr.get_dim(1)]
                                         )
-                                        v_a = transfer_read(
+                                        v_a_bf16 = transfer_read(
                                             vecTy_bf16,
                                             sub_a,
                                             [c0, c0],
@@ -465,7 +449,7 @@ def build_module(
                                             cst0_bf16,
                                             [True],
                                         )
-                                        v_b = transfer_read(
+                                        v_b_bf16 = transfer_read(
                                             vecTy_bf16,
                                             sub_b,
                                             [c0],
@@ -474,18 +458,22 @@ def build_module(
                                             [True],
                                         )
 
-                                        # Read current bf16 accumulator
+                                        # Extend bf16 to f32
+                                        v_a_f32 = arith.extf(vecTy_f32, v_a_bf16)
+                                        v_b_f32 = arith.extf(vecTy_f32, v_b_bf16)
+
+                                        # Read current f32 accumulator
                                         v_acc = transfer_read(
-                                            vecTy_bf16,
+                                            vecTy_f32,
                                             l1_acc_tmp,
                                             [c0],
                                             identity_map,
-                                            cst0_bf16,
+                                            cst0_f32,
                                             [True],
                                         )
 
-                                        # FMA (bf16)
-                                        v_result = fma(v_a, v_b, v_acc)
+                                        # FMA in f32
+                                        v_result = fma(v_a_f32, v_b_f32, v_acc)
 
                                         # Write back
                                         transfer_write(
@@ -498,21 +486,18 @@ def build_module(
                                         )
                                         yield_([])
 
-                                    # Horizontal reduction to bf16 scalar
+                                    # Horizontal reduction of f32 accumulator to scalar f32
                                     v_final = transfer_read(
-                                        vecTy_bf16,
+                                        vecTy_f32,
                                         l1_acc_tmp,
                                         [c0],
                                         identity_map,
-                                        cst0_bf16,
+                                        cst0_f32,
                                         [True],
                                     )
-                                    partial_sum_bf16 = vector_reduction(
-                                        xrt_dtype_in, "add", v_final
+                                    partial_sum = vector_reduction(
+                                        f32_type, "add", v_final
                                     )
-
-                                    # Extend bf16 to f32 for adding to received cascade value
-                                    partial_sum = arith.extf(f32_type, partial_sum_bf16)
 
                                     # Load received upstream partial sum (f32)
                                     sub_recv = subview(_l1_recv, [row], [1], [1])
@@ -550,30 +535,35 @@ def build_module(
 
                                 # Compute partial dot + add recv + write to scratch
                                 for row in range_(0, m_input):
-                                    # Initialize bf16 accumulator to zero
-                                    zero_vec_bf16 = BroadcastOp(vecTy_bf16, cst0_bf16)
+                                    # Initialize f32 accumulator to zero
+                                    zero_vec_f32 = BroadcastOp(vecTy_f32, cst0_f32)
                                     transfer_write(
                                         None,
-                                        zero_vec_bf16,
+                                        zero_vec_f32,
                                         l1_acc_tmp,
                                         [c0],
                                         identity_map,
                                         [True],
                                     )
 
-                                    # Vectorized dot product over k_chunk
-                                    for j_k in range_(0, k_chunk, vec_size):
-                                        # Subview of A: [row, j_k:j_k+vec_size]
+                                    # Vectorized dot product: bf16 inputs → f32 accumulation
+                                    for j_k in range_(0, k_chunk, f32_vec_size):
+                                        # Subview of A: [row, j_k:j_k+f32_vec_size]
                                         sub_a = subview(
-                                            _l1_a, [row, j_k], [1, vec_size], [1, 1]
+                                            _l1_a,
+                                            [row, j_k],
+                                            [1, f32_vec_size],
+                                            [1, 1],
                                         )
-                                        sub_b = subview(_l1_b, [j_k], [vec_size], [1])
+                                        sub_b = subview(
+                                            _l1_b, [j_k], [f32_vec_size], [1]
+                                        )
 
                                         # Map (d0, d1) -> (d1) to read along the k dimension
                                         read_map_2d = AffineMap.get(
                                             2, 0, [AffineExpr.get_dim(1)]
                                         )
-                                        v_a = transfer_read(
+                                        v_a_bf16 = transfer_read(
                                             vecTy_bf16,
                                             sub_a,
                                             [c0, c0],
@@ -581,7 +571,7 @@ def build_module(
                                             cst0_bf16,
                                             [True],
                                         )
-                                        v_b = transfer_read(
+                                        v_b_bf16 = transfer_read(
                                             vecTy_bf16,
                                             sub_b,
                                             [c0],
@@ -590,18 +580,22 @@ def build_module(
                                             [True],
                                         )
 
-                                        # Read current bf16 accumulator
+                                        # Extend bf16 to f32
+                                        v_a_f32 = arith.extf(vecTy_f32, v_a_bf16)
+                                        v_b_f32 = arith.extf(vecTy_f32, v_b_bf16)
+
+                                        # Read current f32 accumulator
                                         v_acc = transfer_read(
-                                            vecTy_bf16,
+                                            vecTy_f32,
                                             l1_acc_tmp,
                                             [c0],
                                             identity_map,
-                                            cst0_bf16,
+                                            cst0_f32,
                                             [True],
                                         )
 
-                                        # FMA (bf16)
-                                        v_result = fma(v_a, v_b, v_acc)
+                                        # FMA in f32
+                                        v_result = fma(v_a_f32, v_b_f32, v_acc)
 
                                         # Write back
                                         transfer_write(
@@ -614,21 +608,18 @@ def build_module(
                                         )
                                         yield_([])
 
-                                    # Horizontal reduction to bf16 scalar
+                                    # Horizontal reduction of f32 accumulator to scalar f32
                                     v_final = transfer_read(
-                                        vecTy_bf16,
+                                        vecTy_f32,
                                         l1_acc_tmp,
                                         [c0],
                                         identity_map,
-                                        cst0_bf16,
+                                        cst0_f32,
                                         [True],
                                     )
-                                    partial_sum_bf16 = vector_reduction(
-                                        xrt_dtype_in, "add", v_final
+                                    partial_sum = vector_reduction(
+                                        f32_type, "add", v_final
                                     )
-
-                                    # Extend bf16 to f32 for adding to received cascade value
-                                    partial_sum = arith.extf(f32_type, partial_sum_bf16)
 
                                     # Load received upstream partial sum (f32)
                                     sub_recv = subview(_l1_recv, [row], [1], [1])
