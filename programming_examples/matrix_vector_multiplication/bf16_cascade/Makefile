@@ -48,23 +48,19 @@ profile: build-test-exe
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && python3 ${srcdir}/matvec_cascade.py $(OUTPUT_FORMAT_FLAG) --compile-mode compile-and-xclbin --m $(M) --k $(K) --tile-m $(TILE_M) --m-input $(M_INPUT) --herd-cols $(HERD_COLS) --n-cascade $(N_CASCADE)
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && LD_LIBRARY_PATH=$$XILINX_XRT/lib:$$LD_LIBRARY_PATH ./test.exe -x air.xclbin -k MLIR_AIE -i air.insts.bin -M $(M) -K $(K)
 
-# Default: 8 columns x 4 cascade tiles, M=2048, K=8192, tile_m=2
-run1:
+# 8 columns x 4 cascade tiles (full device, tile_m=2 fits L2)
+run_8col:
 	$(MAKE) run M=2048 K=8192 TILE_M=2 M_INPUT=1 HERD_COLS=8 N_CASCADE=4 OUTPUT_FORMAT=elf
 
-profile1:
+profile_8col:
 	$(MAKE) profile M=2048 K=8192 TILE_M=2 M_INPUT=1 HERD_COLS=8 N_CASCADE=4
 
-# 4 columns x 4 cascade tiles (half-device, tile_m=4 fits L2)
+# 4 columns x 4 cascade tiles (half device, tile_m=4 fits L2)
 run_4col:
 	$(MAKE) run M=2048 K=8192 TILE_M=4 M_INPUT=1 HERD_COLS=4 N_CASCADE=4 OUTPUT_FORMAT=elf
 
 profile_4col:
 	$(MAKE) profile M=2048 K=8192 TILE_M=4 M_INPUT=1 HERD_COLS=4 N_CASCADE=4
-
-# Smaller test: 2 columns x 4 cascade tiles
-run_small:
-	$(MAKE) run M=256 K=512 TILE_M=4 M_INPUT=1 HERD_COLS=2 N_CASCADE=4
 
 build-test-exe:
 	@GPP=$$( \
