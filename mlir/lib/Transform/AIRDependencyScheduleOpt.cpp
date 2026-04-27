@@ -6354,6 +6354,45 @@ public:
       }
     }
 
+    // Strip compute ops from herd bodies before loop unrolling to reduce the
+    // O(N * body_size) deep-clone cost during loopUnrollFull. Only runs when
+    // there are actually loops to unroll. Keeps channel ops, dma_memcpy_nd,
+    // allocs, deallocations, wait_alls and their transitive operand-defining
+    // ops. Compute ops (matmul, softmax, etc.) are removed by air-to-std later
+    // anyway, so this pre-stripping is safe for all downstream passes.
+    if (!forLoopsToUnroll.empty()) {
+      for (auto scfFor : forLoopsToUnroll) {
+        scfFor.walk([](air::HerdOp herdOp) {
+          Block &body = herdOp.getBody().front();
+          // Collect ops to keep: all DMA ops plus memory management.
+          llvm::SmallPtrSet<Operation *, 16> toKeep;
+          if (!body.empty())
+            toKeep.insert(body.getTerminator());
+          for (Operation &op : body.without_terminator())
+            if (isa<air::ChannelInterface, air::DmaMemcpyNdOp, memref::AllocOp,
+                    memref::DeallocOp, air::WaitAllOp>(op))
+              toKeep.insert(&op);
+          // Expand transitively: add ops whose results are consumed by kept
+          // ops.
+          SmallVector<Operation *> worklist(toKeep.begin(), toKeep.end());
+          while (!worklist.empty()) {
+            Operation *op = worklist.pop_back_val();
+            for (Value operand : op->getOperands())
+              if (Operation *defOp = operand.getDefiningOp())
+                if (defOp->getBlock() == &body && toKeep.insert(defOp).second)
+                  worklist.push_back(defOp);
+          }
+          // Erase ops not in toKeep, in reverse block order to respect def-use.
+          SmallVector<Operation *> toErase;
+          for (Operation &op : body.without_terminator())
+            if (!toKeep.contains(&op))
+              toErase.push_back(&op);
+          for (auto it = toErase.rbegin(); it != toErase.rend(); ++it)
+            (*it)->erase();
+        });
+      }
+    }
+
     auto applyCanonicalizationPatterns = [](MLIRContext *ctx, Region &region) {
       RewritePatternSet affineArithCanoPatterns(ctx);
       mlir::affine::AffineApplyOp::getCanonicalizationPatterns(
