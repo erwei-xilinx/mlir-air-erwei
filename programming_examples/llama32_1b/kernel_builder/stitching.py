@@ -31,11 +31,20 @@ def _extract_between_func_and_return(mlir_text):
 
 
 def _extract_affine_maps(mlir_text):
-    return [l for l in mlir_text.split("\n") if l.startswith("#map")]
+    """Top-level affine attribute decls: `#map...` and `#set...` lines."""
+    return [
+        l for l in mlir_text.split("\n")
+        if l.startswith("#map") or l.startswith("#set")
+    ]
 
 
 def _extract_private_funcs(mlir_text):
     return [l for l in mlir_text.split("\n") if "func.func private" in l]
+
+
+def _extract_channel_decls(mlir_text):
+    """Extract module-level `air.channel @name ...` declaration lines."""
+    return [l for l in mlir_text.split("\n") if re.match(r"\s*air\.channel @", l)]
 
 
 _DEFAULT_EXTERN_FUNCS = {
@@ -182,8 +191,11 @@ def _wrap_ir_in_launch(mlir_text):
 
 def _rename_all_with_externs(text, prefix, extern_funcs):
     """Like _rename_all but with a configurable extern_funcs set."""
-    # Affine maps (longest first)
-    for name in sorted(set(re.findall(r"#map\d*", text)), key=len, reverse=True):
+    # Affine attribute symbols: `#map...` and `#set...` (longest first).
+    affine_names = set(re.findall(r"#map\d*", text)) | set(
+        re.findall(r"#set\d*", text)
+    )
+    for name in sorted(affine_names, key=len, reverse=True):
         text = re.sub(re.escape(name) + r"(?!\w)", f"#{prefix}_{name[1:]}", text)
 
     # SSA word values

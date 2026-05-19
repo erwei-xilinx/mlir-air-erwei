@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""O GEMV + FFN — 8-launch multi-launch ELF for decode.
+"""O GEMV + FFN — 7-launch multi-launch ELF for decode.
 
 Merges the entire post-attention + FFN pipeline into a single ELF:
   L1: O GEMV       [8,1]  wo x attn_out -> proj          (M=2048, K=2048)
@@ -10,8 +10,13 @@ Merges the entire post-attention + FFN pipeline into a single ELF:
   L4: Gate GEMV    [8,1]  wgate x normed2 -> gate         (M=8192, K=2048)
   L5: Up GEMV      [8,1]  wup x normed2 -> up             (M=8192, K=2048)
   L6: SiLU x mul   [8,1]  SiLU(gate) x up -> swiglu      (N=8192)
-  L7: Down GEMV    [8,1]  wdown x swiglu -> down          (M=2048, K=8192)
-  L8: Eltwise Add  [8,1]  down + res1 -> output           (N=2048)
+  LD: Down GEMV + Add [8,4 cascade W->E]  wdown x swiglu + res1 -> output
+                                                          (M=2048, K=8192)
+
+LD fuses the former L7 (Down GEMV) and L8 (residual Add) into one
+launch via the matvec_cascade_add kernel (PR #1612), so arg13 (`down`)
+is no longer used on-device but is kept in the func signature for
+caller backward-compat.
 
 func @o_gemv_ffn(
     %arg0:  memref<2048x2048xbf16>,   # wo
@@ -27,7 +32,7 @@ func @o_gemv_ffn(
     %arg10: memref<8192xbf16>,         # up
     %arg11: memref<8192xbf16>,         # swiglu
     %arg12: memref<2048x8192xbf16>,   # wdown
-    %arg13: memref<2048xbf16>,         # down
+    %arg13: memref<2048xbf16>,         # down (UNUSED after LD fusion)
     %arg14: memref<2048xbf16>,         # output
 )
 """
@@ -48,11 +53,19 @@ sys.path.insert(
         os.path.dirname(__file__), "..", "..", "matrix_vector_multiplication", "bf16"
     ),
 )
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(__file__),
+        "..", "..", "matrix_vector_multiplication", "bf16_cascade",
+    ),
+)
 
 from kernel_builder.stitching import (
     _extract_between_func_and_return,
     _extract_affine_maps,
     _extract_private_funcs,
+    _extract_channel_decls,
     _rename_all,
     _fix_launch_func_args,
     _wrap_ir_in_launch,
@@ -312,32 +325,35 @@ def build_o_gemv_ffn_module(
     m_input=4,
     down_tile_m=2,
     down_m_input=1,
+    down_n_cascade=4,
     herd_m=8,
 ):
-    """Build 8-launch O GEMV + FFN decode pipeline in one ELF.
+    """Build 7-launch O GEMV + FFN decode pipeline in one ELF.
 
     Combines: O GEMV + Add + RMSNorm + Gate GEMV + Up GEMV + SiLU*mul
-              + Down GEMV + Add
+              + LD (Down GEMV + Add fused via matvec_cascade_add).
 
     K=2048 GEMVs use tile_m=8, m_input=4 (original optimal params).
-    K=8192 Down GEMV uses tile_m=2, m_input=1 (smaller tiles for large K).
-    The external func type mismatch is resolved by renaming the Down GEMV's
-    @matvec to @dg_matvec_vectorized_bf16_bf16 with separate link_with.
+    LD (K=8192) uses tile_m=2, m_input=1, herd_cols=8, n_cascade=4 —
+    a [8,4] W->E cascade producing D = wdown @ swiglu + res1 in one
+    launch. The cascade kernel is fully inline (no external .o), so
+    the former L7's mv_k8192.o extern-rename plumbing is gone.
     """
     from matvec import build_module as build_gemv
     from eltwise_add.eltwise_add import build_module as build_add
     from kernel_builder.ffn_swiglu.silu_and_mul import (
         build_module as build_silu,
     )
+    from matvec_cascade_add import build_module as build_cascade_add
 
     # ------- L1: O GEMV (M=2048, K=2048) -------
-    print("  [1/8] O GEMV...")
+    print("  [1/7] O GEMV...")
     o_gemv_ir = str(
         build_gemv(emb_dim, emb_dim, tile_m, m_input, herd_m, bfloat16, bfloat16)
     )
 
     # ------- L2: Eltwise Add (N=2048, herd=[8,1]) -------
-    print("  [2/8] Eltwise Add (post-attn residual)...")
+    print("  [2/7] Eltwise Add (post-attn residual)...")
     add1_ir = _wrap_ir_in_launch(
         str(
             build_add(
@@ -347,50 +363,49 @@ def build_o_gemv_ffn_module(
     )
 
     # ------- L3: RMSNorm (M=1, N=2048, herd=[1,1]) — custom 1D wrapper -------
-    print("  [3/8] RMSNorm (1D decode)...")
+    print("  [3/7] RMSNorm (1D decode)...")
     rms_ir = _build_rms_1d_ir(emb_dim, vector_size=16)
 
     # ------- L4: Gate GEMV (M=8192, K=2048) -------
-    print("  [4/8] Gate GEMV...")
+    print("  [4/7] Gate GEMV...")
     gate_ir = str(
         build_gemv(hidden_dim, emb_dim, tile_m, m_input, herd_m, bfloat16, bfloat16)
     )
 
     # ------- L5: Up GEMV (M=8192, K=2048) -------
-    print("  [5/8] Up GEMV...")
+    print("  [5/7] Up GEMV...")
     up_ir = str(
         build_gemv(hidden_dim, emb_dim, tile_m, m_input, herd_m, bfloat16, bfloat16)
     )
 
     # ------- L6: SiLU x mul (N=8192, herd=[8,1]) -------
-    print("  [6/8] SiLU x mul...")
+    print("  [6/7] SiLU x mul...")
     silu_ir = _wrap_ir_in_launch(
         str(build_silu(hidden_dim, hidden_dim // 8, bfloat16, herd_x=8, herd_y=1))
     )
 
-    # ------- L7: Down GEMV (M=2048, K=8192) — smaller tiles, renamed extern func -------
-    print("  [7/8] Down GEMV...")
+    # ------- LD: Down GEMV + residual Add (M=2048, K=8192) —
+    #            [8 cols, n_cascade=4] W->E cascade, fully inline kernel.
+    print("  [7/7] LD: Down GEMV + Add (cascade)...")
     down_ir = str(
-        build_gemv(
-            emb_dim, hidden_dim, down_tile_m, down_m_input, herd_m, bfloat16, bfloat16
-        )
-    )
-
-    # ------- L8: Eltwise Add (N=2048, herd=[8,1]) -------
-    print("  [8/8] Eltwise Add (FFN residual)...")
-    add2_ir = _wrap_ir_in_launch(
-        str(
-            build_add(
-                emb_dim, emb_dim // 8, bfloat16, vector_size=16, herd_x=8, herd_y=1
-            )
+        build_cascade_add(
+            emb_dim,
+            hidden_dim,
+            down_tile_m,
+            down_m_input,
+            herd_m,
+            down_n_cascade,
+            bfloat16,
+            bfloat16,
         )
     )
 
     # -----------------------------------------------------------------------
-    # Stitch all 8 launches into a single func
+    # Stitch all 7 launches into a single func
     # -----------------------------------------------------------------------
-    # Arg mapping: each sub-kernel has 3 func args (0, 1, 2).
-    # Map to combined func args (0..14).
+    # K=2048 sub-kernels have 3 func args (0, 1, 2). LD has 4 (A, B, R, D).
+    # Map to combined func args (0..14). arg13 (`down`) is unused after LD
+    # fusion but remains in the func signature for caller backward-compat.
     stitch_specs = [
         (o_gemv_ir, "og", {0: 0, 1: 1, 2: 2}),  # wo, attn_out, proj
         (add1_ir, "a1", {0: 2, 1: 3, 2: 4}),  # proj, x_residual, res1
@@ -398,51 +413,36 @@ def build_o_gemv_ffn_module(
         (gate_ir, "gg", {0: 7, 1: 6, 2: 8}),  # wgate, normed2, gate
         (up_ir, "ug", {0: 9, 1: 6, 2: 10}),  # wup, normed2, up
         (silu_ir, "sw", {0: 8, 1: 10, 2: 11}),  # gate, up, swiglu
-        (down_ir, "dg", {0: 12, 1: 11, 2: 13}),  # wdown, swiglu, down
-        (add2_ir, "a2", {0: 13, 1: 4, 2: 14}),  # down, res1, output
+        (down_ir, "ld", {0: 12, 1: 11, 2: 4, 3: 14}),  # wdown, swiglu, res1, output
     ]
 
-    # Down GEMV (K=8192) has different @matvec signature than K=2048 GEMVs.
-    # Solution: rename Down GEMV's external functions and link with a separate .o
-    # compiled with -Dmatvec_vectorized_bf16_bf16=dg_matvec_vectorized_bf16_bf16
-    _EXTERN_K2048 = {
+    _EXTERN_FUNCS = {
         "@matvec_vectorized_bf16_bf16",
         "@linalg_fill_bf16",
         "@silu_and_mul_bf16",
     }
-    # Down GEMV: matvec/linalg_fill NOT preserved → get renamed with "dg" prefix
-    _EXTERN_DOWN = {"@silu_and_mul_bf16"}
 
-    bodies, maps_all = [], []
+    bodies, maps_all, channel_decls_all = [], [], []
     for ir, prefix, arg_map in stitch_specs:
         body = _extract_between_func_and_return(ir)
         maps = _extract_affine_maps(ir)
-        externs = _EXTERN_DOWN if prefix == "dg" else _EXTERN_K2048
-        body = _rename_all_with_externs(body, prefix, externs)
-        maps = [_rename_all_with_externs(m, prefix, externs) for m in maps]
+        chans = _extract_channel_decls(ir)
+        body = _rename_all_with_externs(body, prefix, _EXTERN_FUNCS)
+        maps = [_rename_all_with_externs(m, prefix, _EXTERN_FUNCS) for m in maps]
+        chans = [_rename_all_with_externs(c, prefix, _EXTERN_FUNCS) for c in chans]
         body = _fix_launch_func_args(body, prefix, arg_map)
-        # Down GEMV: also change link_with in the herd body
-        if prefix == "dg":
-            body = body.replace('link_with = "mv.o"', 'link_with = "mv_k8192.o"')
         bodies.append(body)
         maps_all.extend(maps)
+        channel_decls_all.extend(chans)
 
-    # Collect private func declarations
+    # Collect private func declarations from the K=2048 sub-IRs and silu.
+    # LD (matvec_cascade_add) has no private funcs (no extern .o).
     k2048_privates = _extract_private_funcs(o_gemv_ir)
     silu_privates = _extract_private_funcs(silu_ir)
 
-    # Down GEMV: rename private declarations AND change link_with to "mv_k8192.o"
-    down_privates = _extract_private_funcs(down_ir)
-    down_privates_renamed = []
-    for p in down_privates:
-        p_renamed = _rename_all_with_externs(p, "dg", _EXTERN_DOWN)
-        # Change link_with from "mv.o" to "mv_k8192.o"
-        p_renamed = p_renamed.replace('link_with = "mv.o"', 'link_with = "mv_k8192.o"')
-        down_privates_renamed.append(p_renamed.strip())
-
     seen_funcs = set()
     all_privates = []
-    for p in k2048_privates + down_privates_renamed + silu_privates:
+    for p in k2048_privates + silu_privates:
         fname = re.search(r"@(\w+)", p)
         if fname and fname.group(1) not in seen_funcs:
             seen_funcs.add(fname.group(1))
@@ -450,6 +450,7 @@ def build_o_gemv_ffn_module(
 
     combined = "\n".join(maps_all) + f"""
 module {{
+  {chr(10).join('  ' + c.strip() for c in channel_decls_all)}
   {chr(10).join('  ' + p for p in all_privates)}
   func.func @o_gemv_ffn(
     %arg0: memref<{emb_dim}x{emb_dim}xbf16>,
@@ -478,7 +479,7 @@ module {{
 
     with Context() as ctx:
         module = Module.parse(combined, ctx)
-        print(f"  Module: {len(combined.splitlines())} lines, 15 args, 8 launches")
+        print(f"  Module: {len(combined.splitlines())} lines, 15 args, 7 launches")
         return module
 
 
@@ -567,7 +568,6 @@ if __name__ == "__main__":
             verbose=args.verbose,
             omit_while_true_loop=False,
             omit_pingpong="all",
-            runtime_loop_tiling_sizes=[16, 16],
             output_format=args.output_format,
             instance_name="o_gemv_ffn",
         )
@@ -607,7 +607,6 @@ if __name__ == "__main__":
         omit_pingpong="all",
         output_format="elf",
         instance_name="o_gemv_ffn",
-        runtime_loop_tiling_sizes=[16, 16],
         use_lock_race_condition_fix=False,
     )
     sys.exit(

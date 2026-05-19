@@ -51,11 +51,18 @@ RGR_BACKEND = {
 
 # OGF includes the K=8192 down-projection GEMV; ping-pong off because
 # L1 is too tight to hold both buffers for that K.
+# Drop runtime_loop_tiling_sizes: o_gemv_ffn now embeds the cascade L-D
+# (matvec_cascade_add), which needs a different tile from the K=2048
+# launches in the same module. Auto-default (PR #1616) picks per-loop.
 OGF_BACKEND = {
     "output_format": "elf",
     "instance_name": "o_gemv_ffn",
     "omit_pingpong": "all",
-    **{k: v for k, v in GEMV_K2048_BACKEND.items() if k != "omit_pingpong"},
+    **{
+        k: v
+        for k, v in GEMV_K2048_BACKEND.items()
+        if k not in ("omit_pingpong", "runtime_loop_tiling_sizes")
+    },
 }
 
 LM_GEMV_BACKEND = {
