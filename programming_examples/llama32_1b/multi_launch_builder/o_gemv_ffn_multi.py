@@ -1,27 +1,27 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""O GEMV + FFN — 7-launch multi-launch ELF for decode.
+"""O GEMV + FFN — 6-launch multi-launch ELF for decode.
 
 Merges the entire post-attention + FFN pipeline into a single ELF:
-  L1: O GEMV       [8,1]  wo x attn_out -> proj          (M=2048, K=2048)
-  L2: Eltwise Add  [8,1]  proj + x_residual -> res1      (N=2048)
-  L3: RMSNorm      [1,1]  res1 x ffn_norm_w -> normed2   (M=1, N=2048)
-  L4: Gate GEMV    [8,1]  wgate x normed2 -> gate         (M=8192, K=2048)
-  L5: Up GEMV      [8,1]  wup x normed2 -> up             (M=8192, K=2048)
-  L6: SiLU x mul   [8,1]  SiLU(gate) x up -> swiglu      (N=8192)
-  LD: Down GEMV + Add [8,4 cascade W->E]  wdown x swiglu + res1 -> output
+  LA: O GEMV + Add    [8,2 cascade]  wo x attn_out + x_residual -> res1
+                                                          (M=2048, K=2048)
+  L3: RMSNorm         [1,1]  res1 x ffn_norm_w -> normed2 (M=1, N=2048)
+  L4: Gate GEMV       [8,1]  wgate x normed2 -> gate      (M=8192, K=2048)
+  L5: Up GEMV         [8,1]  wup x normed2 -> up          (M=8192, K=2048)
+  L6: SiLU x mul      [8,1]  SiLU(gate) x up -> swiglu    (N=8192)
+  LD: Down GEMV + Add [8,4 cascade]  wdown x swiglu + res1 -> output
                                                           (M=2048, K=8192)
 
-LD fuses the former L7 (Down GEMV) and L8 (residual Add) into one
-launch via the matvec_cascade_add kernel (PR #1612), so arg13 (`down`)
-is no longer used on-device but is kept in the func signature for
-caller backward-compat.
+LA fuses the former L1 (O GEMV) and L2 (residual Add). LD fuses the
+former L7 (Down GEMV) and L8 (residual Add). Both via matvec_cascade_add.
+arg2 (`proj`) and arg13 (`down`) are dead intermediates after fusion but
+are kept in the func signature for caller backward-compat.
 
 func @o_gemv_ffn(
     %arg0:  memref<2048x2048xbf16>,   # wo
     %arg1:  memref<2048xbf16>,         # attn_out
-    %arg2:  memref<2048xbf16>,         # proj
+    %arg2:  memref<2048xbf16>,         # proj  (UNUSED after LA fusion)
     %arg3:  memref<2048xbf16>,         # x_residual
     %arg4:  memref<2048xbf16>,         # res1
     %arg5:  memref<2048xbf16>,         # ffn_norm_w
@@ -323,70 +323,71 @@ def build_o_gemv_ffn_module(
     hidden_dim=8192,
     tile_m=8,
     m_input=4,
+    o_n_cascade=2,
     down_tile_m=2,
     down_m_input=1,
     down_n_cascade=4,
     herd_m=8,
 ):
-    """Build 7-launch O GEMV + FFN decode pipeline in one ELF.
+    """Build 6-launch O GEMV + FFN decode pipeline in one ELF.
 
-    Combines: O GEMV + Add + RMSNorm + Gate GEMV + Up GEMV + SiLU*mul
+    Combines: LA (O GEMV + Add fused via matvec_cascade_add)
+              + RMSNorm + Gate GEMV + Up GEMV + SiLU*mul
               + LD (Down GEMV + Add fused via matvec_cascade_add).
 
-    K=2048 GEMVs use tile_m=8, m_input=4 (original optimal params).
+    LA (K=2048) uses tile_m=8, m_input=4, herd_cols=8, n_cascade=2 —
+    a [8,2] N->S cascade producing res1 = wo @ attn_out + x_residual.
     LD (K=8192) uses tile_m=2, m_input=1, herd_cols=8, n_cascade=4 —
-    a [8,4] W->E cascade producing D = wdown @ swiglu + res1 in one
-    launch. The cascade kernel is fully inline (no external .o), so
-    the former L7's mv_k8192.o extern-rename plumbing is gone.
+    a [8,4] cascade producing output = wdown @ swiglu + res1. Both
+    cascade kernels are fully inline (no external .o).
     """
     from matvec import build_module as build_gemv
-    from eltwise_add.eltwise_add import build_module as build_add
     from kernel_builder.ffn_swiglu.silu_and_mul import (
         build_module as build_silu,
     )
     from matvec_cascade_add import build_module as build_cascade_add
 
-    # ------- L1: O GEMV (M=2048, K=2048) -------
-    print("  [1/7] O GEMV...")
+    # ------- LA: O GEMV + residual Add (M=2048, K=2048) —
+    #            [8 cols, n_cascade=2] cascade, fully inline kernel.
+    print("  [1/6] LA: O GEMV + Add (cascade)...")
     o_gemv_ir = str(
-        build_gemv(emb_dim, emb_dim, tile_m, m_input, herd_m, bfloat16, bfloat16)
-    )
-
-    # ------- L2: Eltwise Add (N=2048, herd=[8,1]) -------
-    print("  [2/7] Eltwise Add (post-attn residual)...")
-    add1_ir = _wrap_ir_in_launch(
-        str(
-            build_add(
-                emb_dim, emb_dim // 8, bfloat16, vector_size=16, herd_x=8, herd_y=1
-            )
+        build_cascade_add(
+            emb_dim,
+            emb_dim,
+            tile_m,
+            m_input,
+            herd_m,
+            o_n_cascade,
+            bfloat16,
+            bfloat16,
         )
     )
 
     # ------- L3: RMSNorm (M=1, N=2048, herd=[1,1]) — custom 1D wrapper -------
-    print("  [3/7] RMSNorm (1D decode)...")
+    print("  [2/6] RMSNorm (1D decode)...")
     rms_ir = _build_rms_1d_ir(emb_dim, vector_size=16)
 
     # ------- L4: Gate GEMV (M=8192, K=2048) -------
-    print("  [4/7] Gate GEMV...")
+    print("  [3/6] Gate GEMV...")
     gate_ir = str(
         build_gemv(hidden_dim, emb_dim, tile_m, m_input, herd_m, bfloat16, bfloat16)
     )
 
     # ------- L5: Up GEMV (M=8192, K=2048) -------
-    print("  [5/7] Up GEMV...")
+    print("  [4/6] Up GEMV...")
     up_ir = str(
         build_gemv(hidden_dim, emb_dim, tile_m, m_input, herd_m, bfloat16, bfloat16)
     )
 
     # ------- L6: SiLU x mul (N=8192, herd=[8,1]) -------
-    print("  [6/7] SiLU x mul...")
+    print("  [5/6] SiLU x mul...")
     silu_ir = _wrap_ir_in_launch(
         str(build_silu(hidden_dim, hidden_dim // 8, bfloat16, herd_x=8, herd_y=1))
     )
 
     # ------- LD: Down GEMV + residual Add (M=2048, K=8192) —
-    #            [8 cols, n_cascade=4] W->E cascade, fully inline kernel.
-    print("  [7/7] LD: Down GEMV + Add (cascade)...")
+    #            [8 cols, n_cascade=4] cascade, fully inline kernel.
+    print("  [6/6] LD: Down GEMV + Add (cascade)...")
     down_ir = str(
         build_cascade_add(
             emb_dim,
@@ -401,14 +402,13 @@ def build_o_gemv_ffn_module(
     )
 
     # -----------------------------------------------------------------------
-    # Stitch all 7 launches into a single func
+    # Stitch all 6 launches into a single func
     # -----------------------------------------------------------------------
-    # K=2048 sub-kernels have 3 func args (0, 1, 2). LD has 4 (A, B, R, D).
-    # Map to combined func args (0..14). arg13 (`down`) is unused after LD
-    # fusion but remains in the func signature for caller backward-compat.
+    # LA and LD are 4-arg cascade kernels (A, B, R, D); the rest are 3-arg.
+    # arg2 (`proj`) and arg13 (`down`) are dead intermediates after fusion
+    # but stay in the func signature for caller backward-compat.
     stitch_specs = [
-        (o_gemv_ir, "og", {0: 0, 1: 1, 2: 2}),  # wo, attn_out, proj
-        (add1_ir, "a1", {0: 2, 1: 3, 2: 4}),  # proj, x_residual, res1
+        (o_gemv_ir, "la", {0: 0, 1: 1, 2: 3, 3: 4}),  # wo, attn_out, x_residual, res1
         (rms_ir, "rm", {0: 4, 1: 5, 2: 6}),  # res1, ffn_norm_w, normed2
         (gate_ir, "gg", {0: 7, 1: 6, 2: 8}),  # wgate, normed2, gate
         (up_ir, "ug", {0: 9, 1: 6, 2: 10}),  # wup, normed2, up
@@ -437,7 +437,10 @@ def build_o_gemv_ffn_module(
 
     # Collect private func declarations from the K=2048 sub-IRs and silu.
     # LD (matvec_cascade_add) has no private funcs (no extern .o).
-    k2048_privates = _extract_private_funcs(o_gemv_ir)
+    # K=2048 GEMV private decls (@matvec_vectorized_bf16_bf16,
+    # @linalg_fill_bf16) come from any remaining build_gemv sub-IR.
+    # After LA fusion, gate_ir is the first available source.
+    k2048_privates = _extract_private_funcs(gate_ir)
     silu_privates = _extract_private_funcs(silu_ir)
 
     seen_funcs = set()
@@ -479,7 +482,7 @@ module {{
 
     with Context() as ctx:
         module = Module.parse(combined, ctx)
-        print(f"  Module: {len(combined.splitlines())} lines, 15 args, 7 launches")
+        print(f"  Module: {len(combined.splitlines())} lines, 15 args, 6 launches")
         return module
 
 
