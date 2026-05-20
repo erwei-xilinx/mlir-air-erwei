@@ -135,6 +135,140 @@ def build_module(n, tile_n, np_dtype_in, herd_x=1, herd_y=None):
 
 
 @module_builder
+def build_module_combined(n, tile_n, np_dtype_in, herd_x=1, herd_y=None):
+    """SiLU·mul over a single blocked combined input buffer.
+
+    Input layout: combined[2n] with combined[0:n] = gate and
+    combined[n:2n] = up (concatenated, not interleaved). Each tile reads
+    contiguous gate and up slices from the same source memref (stride 1,
+    different base offsets), avoiding the bf16 stride-2 alignment issue
+    that affects shim DMAs at non-4B-aligned starting offsets.
+
+    Used by the L-C1 fusion of o_gemv_ffn: the upstream L_GU launch
+    produces wgate@normed2 then wup@normed2 in one blocked buffer; this
+    kernel consumes it without an unpacking step.
+    """
+    xrt_dtype = type_mapper(np_dtype_in)
+    if herd_y is None:
+        herd_y = 2
+    total_tiles = herd_x * herd_y
+    assert (
+        n % (tile_n * total_tiles) == 0
+    ), f"n ({n}) must be divisible by tile_n * total_tiles ({tile_n * total_tiles})"
+
+    # L3 types
+    l3CombinedTy = MemRefType.get([2 * n], xrt_dtype)
+    l3OutTy = MemRefType.get([n], xrt_dtype)
+
+    # L1 types
+    l1_mem_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
+    l1MemrefTy = MemRefType.get(
+        shape=[tile_n], element_type=xrt_dtype, memory_space=l1_mem_space
+    )
+
+    # External kernel declaration (same .o as build_module).
+    silu_mul_func = FuncOp(
+        "silu_and_mul_bf16",
+        ([l1MemrefTy, l1MemrefTy, l1MemrefTy, T.i32()], []),
+        visibility="private",
+    )
+    silu_mul_func.attributes["link_with"] = StringAttr.get("silu_and_mul.o")
+    silu_mul_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
+
+    @FuncOp.from_py_func(l3CombinedTy, l3OutTy)
+    def silu_and_mul_combined(arg0, arg1):
+        # arg0 = combined [2n]: combined[0:n] = gate, combined[n:2n] = up
+        # arg1 = output [n]
+
+        @launch(operands=[arg0, arg1])
+        def silu_mul_launch(l_combined, l_out):
+
+            @segment(name="silu_mul_seg", operands=[l_combined, l_out])
+            def silu_mul_seg(s_combined, s_out):
+
+                @herd(
+                    name="herd_0",
+                    sizes=[herd_x, herd_y],
+                    operands=[s_combined, s_out],
+                )
+                def herd_body(_tx, _ty, _sx, _sy, l3_combined, l3_out):
+                    l1_gate = AllocOp(l1MemrefTy, [], [])
+                    l1_up = AllocOp(l1MemrefTy, [], [])
+                    l1_out = AllocOp(l1MemrefTy, [], [])
+
+                    tile_n_i32 = ConstantOp(T.i32(), tile_n)
+
+                    for loop_iv in range_(0, n, tile_n * total_tiles):
+                        # Compute linear tile offset in the n-domain.
+                        offset_map = AffineMap.get(
+                            0,
+                            3,
+                            [
+                                AffineExpr.get_add(
+                                    AffineSymbolExpr.get(0),
+                                    AffineExpr.get_mul(
+                                        AffineExpr.get_add(
+                                            AffineExpr.get_mul(
+                                                AffineSymbolExpr.get(1),
+                                                AffineConstantExpr.get(herd_y),
+                                            ),
+                                            AffineSymbolExpr.get(2),
+                                        ),
+                                        AffineConstantExpr.get(tile_n),
+                                    ),
+                                )
+                            ],
+                        )
+                        offset = affine_apply(offset_map, [loop_iv, _tx, _ty])
+                        # Blocked layout: gate base = offset, up base = n + offset;
+                        # both reads are contiguous (stride 1), avoiding bf16
+                        # alignment issues with non-4B starting offsets.
+                        up_off_map = AffineMap.get(
+                            0,
+                            1,
+                            [
+                                AffineExpr.get_add(
+                                    AffineSymbolExpr.get(0),
+                                    AffineConstantExpr.get(n),
+                                )
+                            ],
+                        )
+                        up_off = affine_apply(up_off_map, [offset])
+
+                        dma_memcpy_nd(
+                            l1_gate,
+                            l3_combined,
+                            src_offsets=[offset],
+                            src_sizes=[tile_n],
+                            src_strides=[1],
+                        )
+                        dma_memcpy_nd(
+                            l1_up,
+                            l3_combined,
+                            src_offsets=[up_off],
+                            src_sizes=[tile_n],
+                            src_strides=[1],
+                        )
+
+                        CallOp(silu_mul_func, [l1_gate, l1_up, l1_out, tile_n_i32])
+
+                        dma_memcpy_nd(
+                            l3_out,
+                            l1_out,
+                            dst_offsets=[offset],
+                            dst_sizes=[tile_n],
+                            dst_strides=[1],
+                        )
+                        yield_([])
+
+                    DeallocOp(l1_gate)
+                    DeallocOp(l1_up)
+                    DeallocOp(l1_out)
+
+                herd_body.attributes["link_with"] = StringAttr.get("silu_and_mul.o")
+
+
+@module_builder
 def build_module_2d(rows, cols, tile_n, np_dtype_in, herd_x=8, herd_y=1):
     """Build SwiGLU module with 2D memref inputs: memref<rows x cols x bf16>.
 

@@ -1,38 +1,43 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""O GEMV + FFN — 6-launch multi-launch ELF for decode.
+"""O GEMV + FFN — 5-launch multi-launch ELF for decode.
 
 Merges the entire post-attention + FFN pipeline into a single ELF:
-  LA: O GEMV + Add    [8,2 cascade]  wo x attn_out + x_residual -> res1
+  LA:   O GEMV + Add    [8,2 cascade]  wo x attn_out + x_residual -> res1
                                                           (M=2048, K=2048)
-  L3: RMSNorm         [1,1]  res1 x ffn_norm_w -> normed2 (M=1, N=2048)
-  L4: Gate GEMV       [8,1]  wgate x normed2 -> gate      (M=8192, K=2048)
-  L5: Up GEMV         [8,1]  wup x normed2 -> up          (M=8192, K=2048)
-  L6: SiLU x mul      [8,1]  SiLU(gate) x up -> swiglu    (N=8192)
-  LD: Down GEMV + Add [8,4 cascade]  wdown x swiglu + res1 -> output
+  L3:   RMSNorm         [1,1]  res1 x ffn_norm_w -> normed2 (M=1, N=2048)
+  L_GU: Gate+Up GEMV    [8,1]  w_gateup x normed2 -> gate_up_combined
+                                                          (M=2*hidden_dim, K=2048)
+  L6:   SiLU x mul (interleaved)   [8,1]  gate_up_combined -> swiglu (N=8192)
+  LD:   Down GEMV + Add [8,4 cascade]  wdown x swiglu + res1 -> output
                                                           (M=2048, K=8192)
 
-LA fuses the former L1 (O GEMV) and L2 (residual Add). LD fuses the
-former L7 (Down GEMV) and L8 (residual Add). Both via matvec_cascade_add.
-arg2 (`proj`) and arg13 (`down`) are dead intermediates after fusion but
-are kept in the func signature for caller backward-compat.
+L-A fuses former L1+L2. L-D fuses former L7+L8. L-C1 fuses former L4+L5
+via offline-blocked w_gateup = vstack(wgate, wup); L6 reads the blocked
+combined output (gate in lower half, up in upper half) with contiguous
+DMAs (no stride-2, no bf16 alignment hazard).
+
+arg7 (was wgate [8192,2048]) is now w_gateup [16384,2048].
+arg10 (was up [8192]) is now gate_up_combined [16384].
+arg2 (proj), arg8 (gate), arg9 (wup), arg13 (down) are dead after
+fusion but stay in the signature with original baseline shapes.
 
 func @o_gemv_ffn(
     %arg0:  memref<2048x2048xbf16>,   # wo
     %arg1:  memref<2048xbf16>,         # attn_out
-    %arg2:  memref<2048xbf16>,         # proj  (UNUSED after LA fusion)
+    %arg2:  memref<2048xbf16>,         # proj  (UNUSED)
     %arg3:  memref<2048xbf16>,         # x_residual
     %arg4:  memref<2048xbf16>,         # res1
     %arg5:  memref<2048xbf16>,         # ffn_norm_w
     %arg6:  memref<2048xbf16>,         # normed2
-    %arg7:  memref<8192x2048xbf16>,   # wgate
-    %arg8:  memref<8192xbf16>,         # gate
-    %arg9:  memref<8192x2048xbf16>,   # wup
-    %arg10: memref<8192xbf16>,         # up
+    %arg7:  memref<16384x2048xbf16>,  # w_gateup (interleaved)
+    %arg8:  memref<8192xbf16>,         # gate (UNUSED)
+    %arg9:  memref<8192x2048xbf16>,   # wup (UNUSED)
+    %arg10: memref<16384xbf16>,        # gate_up_combined (interleaved)
     %arg11: memref<8192xbf16>,         # swiglu
     %arg12: memref<2048x8192xbf16>,   # wdown
-    %arg13: memref<2048xbf16>,         # down (UNUSED after LD fusion)
+    %arg13: memref<2048xbf16>,         # down (UNUSED)
     %arg14: memref<2048xbf16>,         # output
 )
 """
@@ -329,27 +334,26 @@ def build_o_gemv_ffn_module(
     down_n_cascade=4,
     herd_m=8,
 ):
-    """Build 6-launch O GEMV + FFN decode pipeline in one ELF.
+    """Build 5-launch O GEMV + FFN decode pipeline in one ELF.
 
-    Combines: LA (O GEMV + Add fused via matvec_cascade_add)
-              + RMSNorm + Gate GEMV + Up GEMV + SiLU*mul
-              + LD (Down GEMV + Add fused via matvec_cascade_add).
+    Combines: LA (O GEMV + Add) + RMSNorm + L_GU (fused Gate+Up GEMV
+    over interleaved w_gateup) + SiLU·mul (interleaved input) + LD
+    (Down GEMV + Add).
 
-    LA (K=2048) uses tile_m=8, m_input=4, herd_cols=8, n_cascade=2 —
-    a [8,2] N->S cascade producing res1 = wo @ attn_out + x_residual.
-    LD (K=8192) uses tile_m=2, m_input=1, herd_cols=8, n_cascade=4 —
-    a [8,4] cascade producing output = wdown @ swiglu + res1. Both
-    cascade kernels are fully inline (no external .o).
+    LA / LD via matvec_cascade_add (cascade kernels). L_GU via plain
+    matvec at doubled M=2*hidden_dim, consuming the offline-prepared
+    interleaved weight buffer (w_gateup[2i] = wgate[i], w_gateup[2i+1] =
+    wup[i]). SiLU·mul reads stride-2 from the same interleaved layout.
     """
     from matvec import build_module as build_gemv
     from kernel_builder.ffn_swiglu.silu_and_mul import (
-        build_module as build_silu,
+        build_module_combined as build_silu_combined,
     )
     from matvec_cascade_add import build_module as build_cascade_add
 
     # ------- LA: O GEMV + residual Add (M=2048, K=2048) —
     #            [8 cols, n_cascade=2] cascade, fully inline kernel.
-    print("  [1/6] LA: O GEMV + Add (cascade)...")
+    print("  [1/5] LA: O GEMV + Add (cascade)...")
     o_gemv_ir = str(
         build_cascade_add(
             emb_dim,
@@ -364,30 +368,31 @@ def build_o_gemv_ffn_module(
     )
 
     # ------- L3: RMSNorm (M=1, N=2048, herd=[1,1]) — custom 1D wrapper -------
-    print("  [2/6] RMSNorm (1D decode)...")
+    print("  [2/5] RMSNorm (1D decode)...")
     rms_ir = _build_rms_1d_ir(emb_dim, vector_size=16)
 
-    # ------- L4: Gate GEMV (M=8192, K=2048) -------
-    print("  [3/6] Gate GEMV...")
-    gate_ir = str(
-        build_gemv(hidden_dim, emb_dim, tile_m, m_input, herd_m, bfloat16, bfloat16)
+    # ------- L_GU: Gate+Up fused via offline-blocked w_gateup
+    #               (M=2*hidden_dim, K=emb_dim). Single matvec at M=16384
+    #               produces gate_up_combined[2*hidden_dim] blocked:
+    #               combined[0:hidden_dim] = gate, combined[hidden_dim:2*hidden_dim] = up.
+    print("  [3/5] L_GU: Gate+Up GEMV (blocked w_gateup)...")
+    gu_ir = str(
+        build_gemv(2 * hidden_dim, emb_dim, tile_m, m_input, herd_m, bfloat16, bfloat16)
     )
 
-    # ------- L5: Up GEMV (M=8192, K=2048) -------
-    print("  [4/6] Up GEMV...")
-    up_ir = str(
-        build_gemv(hidden_dim, emb_dim, tile_m, m_input, herd_m, bfloat16, bfloat16)
-    )
-
-    # ------- L6: SiLU x mul (N=8192, herd=[8,1]) -------
-    print("  [5/6] SiLU x mul...")
+    # ------- L6: SiLU x mul (reads blocked combined input) -------
+    print("  [4/5] SiLU x mul (blocked)...")
     silu_ir = _wrap_ir_in_launch(
-        str(build_silu(hidden_dim, hidden_dim // 8, bfloat16, herd_x=8, herd_y=1))
+        str(
+            build_silu_combined(
+                hidden_dim, hidden_dim // 8, bfloat16, herd_x=8, herd_y=1
+            )
+        )
     )
 
     # ------- LD: Down GEMV + residual Add (M=2048, K=8192) —
     #            [8 cols, n_cascade=4] cascade, fully inline kernel.
-    print("  [6/6] LD: Down GEMV + Add (cascade)...")
+    print("  [5/5] LD: Down GEMV + Add (cascade)...")
     down_ir = str(
         build_cascade_add(
             emb_dim,
@@ -402,17 +407,21 @@ def build_o_gemv_ffn_module(
     )
 
     # -----------------------------------------------------------------------
-    # Stitch all 6 launches into a single func
+    # Stitch all 5 launches into a single func
     # -----------------------------------------------------------------------
-    # LA and LD are 4-arg cascade kernels (A, B, R, D); the rest are 3-arg.
-    # arg2 (`proj`) and arg13 (`down`) are dead intermediates after fusion
-    # but stay in the func signature for caller backward-compat.
+    # LA and LD are 4-arg cascade kernels; L_GU is a 3-arg matvec consuming
+    # the offline-interleaved w_gateup; silu_interleaved is 2-arg.
+    # Arg-slot reuse: arg7 now carries w_gateup [2*hidden_dim, emb_dim] and
+    # arg10 now carries gate_up_combined [2*hidden_dim]. The shapes change
+    # vs the baseline (2x larger), so callers must allocate accordingly.
+    # arg2 (`proj`), arg8 (was gate), arg9 (was wup), arg13 (`down`) are
+    # dead intermediates after fusion; kept in the signature with original
+    # baseline shapes so call sites only need to swap arg7 / arg10 sizes.
     stitch_specs = [
         (o_gemv_ir, "la", {0: 0, 1: 1, 2: 3, 3: 4}),  # wo, attn_out, x_residual, res1
         (rms_ir, "rm", {0: 4, 1: 5, 2: 6}),  # res1, ffn_norm_w, normed2
-        (gate_ir, "gg", {0: 7, 1: 6, 2: 8}),  # wgate, normed2, gate
-        (up_ir, "ug", {0: 9, 1: 6, 2: 10}),  # wup, normed2, up
-        (silu_ir, "sw", {0: 8, 1: 10, 2: 11}),  # gate, up, swiglu
+        (gu_ir, "gu", {0: 7, 1: 6, 2: 10}),  # w_gateup, normed2, gate_up_combined
+        (silu_ir, "sw", {0: 10, 1: 11}),  # gate_up_combined, swiglu
         (down_ir, "ld", {0: 12, 1: 11, 2: 4, 3: 14}),  # wdown, swiglu, res1, output
     ]
 
@@ -439,8 +448,8 @@ def build_o_gemv_ffn_module(
     # LD (matvec_cascade_add) has no private funcs (no extern .o).
     # K=2048 GEMV private decls (@matvec_vectorized_bf16_bf16,
     # @linalg_fill_bf16) come from any remaining build_gemv sub-IR.
-    # After LA fusion, gate_ir is the first available source.
-    k2048_privates = _extract_private_funcs(gate_ir)
+    # After LA + L_GU fusion, gu_ir is the sole build_gemv source.
+    k2048_privates = _extract_private_funcs(gu_ir)
     silu_privates = _extract_private_funcs(silu_ir)
 
     seen_funcs = set()
@@ -463,10 +472,10 @@ module {{
     %arg4: memref<{emb_dim}xbf16>,
     %arg5: memref<{emb_dim}xbf16>,
     %arg6: memref<{emb_dim}xbf16>,
-    %arg7: memref<{hidden_dim}x{emb_dim}xbf16>,
+    %arg7: memref<{2 * hidden_dim}x{emb_dim}xbf16>,
     %arg8: memref<{hidden_dim}xbf16>,
     %arg9: memref<{hidden_dim}x{emb_dim}xbf16>,
-    %arg10: memref<{hidden_dim}xbf16>,
+    %arg10: memref<{2 * hidden_dim}xbf16>,
     %arg11: memref<{hidden_dim}xbf16>,
     %arg12: memref<{emb_dim}x{hidden_dim}xbf16>,
     %arg13: memref<{emb_dim}xbf16>,
@@ -482,7 +491,7 @@ module {{
 
     with Context() as ctx:
         module = Module.parse(combined, ctx)
-        print(f"  Module: {len(combined.splitlines())} lines, 15 args, 6 launches")
+        print(f"  Module: {len(combined.splitlines())} lines, 15 args, 5 launches")
         return module
 
 
@@ -589,14 +598,19 @@ if __name__ == "__main__":
     ffn_norm_w = (np.random.randn(emb_dim) * 0.1 + 1.0).astype(bfloat16)
     normed2_buf = np.zeros(emb_dim, dtype=bfloat16)
     wgate = (np.random.randn(hidden_dim, emb_dim) * 0.02).astype(bfloat16)
-    gate_buf = np.zeros(hidden_dim, dtype=bfloat16)
-    wup = (np.random.randn(hidden_dim, emb_dim) * 0.02).astype(bfloat16)
-    up_buf = np.zeros(hidden_dim, dtype=bfloat16)
+    gate_buf = np.zeros(hidden_dim, dtype=bfloat16)  # dead
+    wup = (np.random.randn(hidden_dim, emb_dim) * 0.02).astype(bfloat16)  # dead
+    # Offline blocked concatenation wgate + wup → w_gateup.
+    w_gateup = np.empty((2 * hidden_dim, emb_dim), dtype=bfloat16)
+    w_gateup[:hidden_dim] = wgate
+    w_gateup[hidden_dim:] = wup
+    gate_up_combined_buf = np.zeros(2 * hidden_dim, dtype=bfloat16)
     swiglu_buf = np.zeros(hidden_dim, dtype=bfloat16)
     wdown = (np.random.randn(emb_dim, hidden_dim) * 0.01).astype(bfloat16)
     down_buf = np.zeros(emb_dim, dtype=bfloat16)
 
-    # CPU reference
+    # CPU reference (uses the original separated wgate/wup; interleaving is
+    # purely a layout choice and produces the same gate/up scalars).
     output_ref = o_gemv_ffn_reference(
         wo, attn_out, x_residual, ffn_norm_w, wgate, wup, wdown
     )
@@ -618,18 +632,18 @@ if __name__ == "__main__":
             inputs=[
                 wo,  # arg0
                 attn_out,  # arg1
-                proj_buf,  # arg2
+                proj_buf,  # arg2 (dead)
                 x_residual,  # arg3
                 res1_buf,  # arg4
                 ffn_norm_w,  # arg5
                 normed2_buf,  # arg6
-                wgate,  # arg7
-                gate_buf,  # arg8
-                wup,  # arg9
-                up_buf,  # arg10
+                w_gateup,  # arg7 (interleaved [2*hidden, emb])
+                gate_buf,  # arg8 (dead)
+                wup,  # arg9 (dead)
+                gate_up_combined_buf,  # arg10 (interleaved output [2*hidden])
                 swiglu_buf,  # arg11
                 wdown,  # arg12
-                down_buf,  # arg13
+                down_buf,  # arg13 (dead)
             ],
             expected_outputs=[output_ref],
             rtol=0.5,
