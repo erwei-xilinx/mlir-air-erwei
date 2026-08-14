@@ -65,18 +65,20 @@ constexpr StringLiteral RefeedCount = "air.refeed_count";
 // spelling matches the broadcast_shape discardable-attr convention on
 // air.channel; read via air::ChannelOp::getPacketIDs. Verified on air.channel.
 constexpr StringLiteral PacketIDs = "packet_ids";
-// The kernel writes the routing packet header into the payload itself.
-// air-to-aie must not stamp a static pkt_id on the producer BD (that would
-// prepend a second header word) and emits the aie.packet_flow with
-// {keep_pkt_header = true} so the switchbox keeps the header at the
-// destination. For a split bundle keep is per-flow (only the offset-0 bearer
-// keeps it); see SrcWritesPktHeader. Bare spelling matches the packet_flow attr
-// in the AIE dialect. Verified on air.channel.
+// DESTINATION-side: the switchbox delivers each packet's header word into the
+// receiving buffer instead of consuming it, so the consumer's memref must
+// include room for it. Mirrors the identically-named attribute on
+// aie.packet_flow, and means only that. It says NOTHING about who wrote the
+// header -- see SrcWritesPktHeader for that. For a split bundle keep is
+// per-flow (only the offset-0 bearer keeps it). Verified on air.channel.
 constexpr StringLiteral KeepPktHeader = "keep_pkt_header";
-// Bundle-wide derived marker set on every split of a KeepPktHeader channel: the
-// bundle source writes its own header, so no split's producer BD may be
-// stamped. Distinct from KeepPktHeader, which is per-flow (offset-0 bearer
-// only).
+// SOURCE-side: this channel's packets reach the DMA with the routing header
+// already in the payload, so no producer BD on it may be stamped (a stamp would
+// prepend a SECOND header word and shift the payload). Written by
+// air-annotate-packet-ids onto every channel in a routing domain whose puts
+// name a `dest`, and copied onto every split of a bundle -- it is bundle-wide,
+// unlike KeepPktHeader, which is per-flow. Read via channelSourceWritesHeader.
+// A hand-written design that stamps its own header states this directly.
 constexpr StringLiteral SrcWritesPktHeader = "air.src_writes_pkt_header";
 // Per-op launch-iteration ("wave") index (i64) on runtime-sequence ops of a
 // fused multi-iteration launch. Assigned in AIRRtToNpu right after the fused
@@ -164,15 +166,20 @@ void walkAsyncTokenConsumers(Operation *root,
 
 namespace xilinx {
 namespace air {
-// True if the PRODUCING KERNEL writes the packet routing header into the
-// payload, rather than the DMA stamping a static id onto the BD. Necessary for
-// any data-dependent routing: a DMA-stamped channel carries one id on one BD
-// and cannot select a destination per packet.
+// True if the SOURCE writes the packet routing header into the payload, rather
+// than the DMA stamping a static id onto the BD. Necessary for any
+// data-dependent routing: a DMA-stamped channel carries one id on one BD and
+// cannot select a destination per packet.
+//
+// This is a SOURCE-side question, and deliberately independent of
+// attrs::KeepPktHeader, which is a DESTINATION-side one (does the receiver's
+// buffer contain the header word). All four combinations are valid on hardware;
+// gating one on the other made two of them inexpressible.
 //
 // Single source of truth. Both air-to-aie (which must not stamp such a BD) and
 // air-annotate-packet-ids (which uses it to gate demux classification) read
 // this; two copies drifted apart once already.
-bool channelKernelWritesHeader(ChannelOp chanOp);
+bool channelSourceWritesHeader(ChannelOp chanOp);
 } // namespace air
 } // namespace xilinx
 

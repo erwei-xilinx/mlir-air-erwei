@@ -145,11 +145,15 @@ void air::copyChannelSteeringAttrs(Operation *src, Operation *dst) {
   // User-pinned packet routing ids, read by AIRToAIE's packet-flow creation.
   if (auto pids = src->getAttrOfType<ArrayAttr>(attrs::PacketIDs))
     dst->setAttr(attrs::PacketIDs, pids);
-  // Kernel-writes-header marker. Copied verbatim;
+  // Destination-side header retention. Copied verbatim;
   // SpecializeChannelBundlePattern narrows it to the offset-0 bearer per-flow
   // after this copy.
   if (auto kph = src->getAttr(attrs::KeepPktHeader))
     dst->setAttr(attrs::KeepPktHeader, kph);
+  // Source-side: this channel's packets arrive with the header already in the
+  // payload, so no producer BD may stamp one. Bundle-wide, never narrowed.
+  if (auto swh = src->getAttr(attrs::SrcWritesPktHeader))
+    dst->setAttr(attrs::SrcWritesPktHeader, swh);
 }
 
 void air::addAsyncDependency(Operation *op, Value token) {
@@ -3846,16 +3850,15 @@ LogicalResult air::ChannelOp::verify() {
   return success();
 }
 
-bool air::channelKernelWritesHeader(air::ChannelOp chanOp) {
+bool air::channelSourceWritesHeader(air::ChannelOp chanOp) {
   if (!chanOp)
     return false;
-  // Several pinned ids on one channel is itself the kernel-written-header
-  // contract: the DMA cannot stamp more than one id, so the core must be
-  // writing it. See the packet_ids docs on air.channel.
+  // Several pinned ids on one channel says it outright: a BD carries one id, so
+  // more than one can only mean the source is writing them. See the packet_ids
+  // docs on air.channel.
   if (auto pids = chanOp.getPacketIDs(); pids && pids.size() > 1)
     return true;
-  return chanOp->hasAttr(air::attrs::KeepPktHeader) ||
-         chanOp->hasAttr(air::attrs::SrcWritesPktHeader);
+  return chanOp->hasAttr(air::attrs::SrcWritesPktHeader);
 }
 
 int air::ChannelOp::getBroadcastDimension() {

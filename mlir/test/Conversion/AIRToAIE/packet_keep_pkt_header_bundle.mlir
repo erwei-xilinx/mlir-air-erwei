@@ -7,12 +7,19 @@
 
 // RUN: air-opt %s -air-to-aie="row-offset=3 col-offset=2 device=xcve2802" | FileCheck %s
 
-// keep_pkt_header is per-FLOW when a bundle is split: two producers gather into
-// one L2 buffer, and only the split whose GET lands at offset 0 keeps the
-// routing header; the offset-8 split strips it. Both producer BDs stay
-// unstamped (air.src_writes_pkt_header marks the whole bundle).
+// The two header markers split DIFFERENTLY, which is the clearest illustration
+// that they are separate properties.
+//
+// Two producers gather into one L2 buffer. There is one source buffer and one
+// header in it, so air.src_writes_pkt_header holds for the whole bundle and
+// every split inherits it -- no producer BD may stamp. But only the split whose
+// GET lands at offset 0 actually RECEIVES that word, so keep_pkt_header is
+// narrowed to it and the offset-8 sibling drops the copy it was given.
+//
+// Source-side is bundle-wide; destination-side is per-flow. One attribute
+// cannot be both.
 
-// No BD (producer or receiver) is statically stamped -- the kernel wrote the
+// No BD (producer or receiver) is statically stamped -- the source wrote the
 // header itself.
 // CHECK-NOT: packet = #aie.packet_info
 
@@ -33,7 +40,7 @@
 // CHECK-NEXT: aie.packet_dest<%{{.*}}, DMA : 1>
 // CHECK-NEXT: }
 
-air.channel @k [2, 1] {channel_type = "npu_dma_packet", keep_pkt_header}
+air.channel @k [2, 1] {air.src_writes_pkt_header, channel_type = "npu_dma_packet", keep_pkt_header}
 func.func @f() {
   %c1 = arith.constant 1 : index
   air.launch (%a, %b) in (%c=%c1, %d=%c1) {

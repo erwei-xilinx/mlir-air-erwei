@@ -37,6 +37,7 @@
 
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Debug.h"
 
 #include <set>
@@ -3634,10 +3635,37 @@ struct Classification {
 };
 
 /// Classify one packet channel from its put/get volumes.
+// Front-end evidence that the SOURCE writes this channel's routing header
+// rather than the DMA stamping it onto the producer BD.
+//
+// Deliberately distinct from air::channelSourceWritesHeader, which is the
+// correctness predicate air-to-aie reads. That one keys on
+// attrs::SrcWritesPktHeader, which THIS PASS writes -- so classification, which
+// runs first, has to read what the design itself said:
+//
+//   - a put naming a `dest`: the destination is a runtime value, so the id
+//     cannot live on a BD. This is the spelling to use.
+//   - several pinned ids: a BD carries one, so more than one says it outright.
+//   - keep_pkt_header: LEGACY. It is a destination-side property and implies
+//     nothing about the source, but every design that predates `dest` used it
+//     as the marker, so it is still accepted here.
+static bool srcWritesHeaderAtInput(air::ChannelOp chanOp,
+                                   const llvm::StringSet<> &destPutChans) {
+  if (!chanOp)
+    return false;
+  if (destPutChans.contains(chanOp.getSymName()))
+    return true;
+  if (auto pids = chanOp.getPacketIDs(); pids && pids.size() > 1)
+    return true;
+  return chanOp->hasAttr(air::attrs::SrcWritesPktHeader) ||
+         chanOp->hasAttr(air::attrs::KeepPktHeader);
+}
+
 static Classification classify(air::ChannelOp chanOp,
                                ArrayRef<air::ChannelInterface> puts,
                                ArrayRef<air::ChannelInterface> gets,
-                               Operation *scopeRoot) {
+                               Operation *scopeRoot,
+                               const llvm::StringSet<> &destPutChans) {
   Classification c;
 
   // A channel's index tuple means one of two different things, and conflating
@@ -3721,7 +3749,7 @@ static Classification classify(air::ChannelOp chanOp,
   // short of the sent total by that much. Accept a partition that accounts for
   // at least the payload and never exceeds what was sent.
   if (sum <= putVol && sum > 0) {
-    if (!air::channelKernelWritesHeader(chanOp)) {
+    if (!srcWritesHeaderAtInput(chanOp, destPutChans)) {
       c.reason = "destination volumes partition the stream, but the channel is "
                  "not source-stamped, so per-packet routing is impossible";
       return c;
@@ -3775,6 +3803,16 @@ void AIRAnnotatePacketIDsPass::runOnOperation() {
       gets[op.getChanName()].push_back(op);
   });
 
+  // Which channels have a put that NAMES its destination. This is the design's
+  // own statement that routing is per-packet, and therefore that the source --
+  // not a producer BD -- carries the id. Collected before classification, which
+  // needs it, and before the emission below clears the operand.
+  llvm::StringSet<> destPutChans;
+  mod.walk([&](air::ChannelPutOp put) {
+    if (put.getDest())
+      destPutChans.insert(put.getChanName());
+  });
+
   // Phase 1: local classification, and the id count it implies on its own.
   llvm::MapVector<StringRef, Classification> shapeOf;
   llvm::MapVector<StringRef, unsigned> localCardinality;
@@ -3784,8 +3822,8 @@ void AIRAnnotatePacketIDsPass::runOnOperation() {
       return;
     packetChans.push_back(chanOp);
     StringRef name = chanOp.getSymName();
-    Classification c =
-        classify(chanOp, puts[name], gets[name], mod.getOperation());
+    Classification c = classify(chanOp, puts[name], gets[name],
+                                mod.getOperation(), destPutChans);
     shapeOf[name] = c;
     localCardinality[name] = (c.shape == Shape::Demux)     ? c.numDests
                              : (c.shape == Shape::Unknown) ? 0
@@ -3827,7 +3865,7 @@ void AIRAnnotatePacketIDsPass::runOnOperation() {
       StringRef name = chanOp.getSymName();
       // Only a header-preserving hop forwards someone else's routing id; a
       // DMA-stamped one re-stamps and starts a fresh routing domain.
-      if (!air::channelKernelWritesHeader(chanOp))
+      if (!srcWritesHeaderAtInput(chanOp, destPutChans))
         continue;
       unsigned want = cardinality[name];
       for (StringRef succ : feeds[name])
@@ -3955,7 +3993,7 @@ void AIRAnnotatePacketIDsPass::runOnOperation() {
     // take them from the top of the space, where nothing else is looking.
     for (air::ChannelOp c : packetChans) {
       StringRef name = c.getSymName();
-      if (pinnedIDsOf(c) || !air::channelKernelWritesHeader(c))
+      if (pinnedIDsOf(c) || !srcWritesHeaderAtInput(c, destPutChans))
         continue;
       auto shapeIt = shapeOf.find(name);
       if (shapeIt == shapeOf.end() || shapeIt->second.shape != Shape::Demux)
@@ -3976,7 +4014,7 @@ void AIRAnnotatePacketIDsPass::runOnOperation() {
       for (air::ChannelOp chanOp : packetChans) {
         StringRef name = chanOp.getSymName();
         if (pinnedIDsOf(chanOp) || idsFor.count(name) ||
-            !air::channelKernelWritesHeader(chanOp))
+            !srcWritesHeaderAtInput(chanOp, destPutChans))
           continue;
         auto feedsIt = feeds.find(name);
         if (feedsIt == feeds.end())
@@ -4016,6 +4054,21 @@ void AIRAnnotatePacketIDsPass::runOnOperation() {
                  << "air-annotate-packet-ids: assigned @" << chanOp.getSymName()
                  << " " << it->second.size() << " id(s)\n");
     }
+
+    // Record, on the channel, that its packets arrive with the header already
+    // in them.
+    //
+    // This is what air-to-aie reads to suppress the producer-BD stamp, and it
+    // has to be stated rather than inferred. It used to be inferred from
+    // keep_pkt_header, which is a DESTINATION-side property (does the receiver
+    // get the header word) and says nothing about the source -- the two were
+    // correlated in every design that predates `dest`, never equivalent. The
+    // whole routing domain is marked, not just the channel whose put names the
+    // dest: the header rides the packet across every forwarding hop, and a
+    // stamp anywhere along the way prepends a second one.
+    for (air::ChannelOp chanOp : packetChans)
+      if (derived.contains(chanOp.getSymName()))
+        chanOp->setAttr(air::attrs::SrcWritesPktHeader, builder.getUnitAttr());
 
     // Emit the routing header ourselves, from the put.
     //

@@ -3267,15 +3267,13 @@ struct SpecializeChannelBundlePattern
       air::copyChannelSteeringAttrs(channel, new_chan);
       std::vector<unsigned> position =
           air::getMDVectorFromIterator(bundle_size_stdvec, iter);
-      // keep_pkt_header is per-flow: only the split whose GET lands at offset 0
-      // keeps the header (it becomes the single routing header); the others
-      // strip it. But every split must still skip the static producer-BD stamp
-      // (the kernel already wrote the header), so mark all splits with
-      // SrcWritesPktHeader and drop KeepPktHeader (copied onto all splits
-      // above) from the non-offset-0 ones.
+      // The two markers split differently, because they answer different
+      // questions. SrcWritesPktHeader is SOURCE-side -- one buffer, one header,
+      // already written -- so it holds for every split and copyChannelSteering-
+      // Attrs carries it across unchanged. keep_pkt_header is DESTINATION-side
+      // and per-flow: only the split whose GET lands at offset 0 receives the
+      // header word, so the others must drop the copy they were given.
       if (new_chan->hasAttr(air::attrs::KeepPktHeader)) {
-        new_chan->setAttr(air::attrs::SrcWritesPktHeader,
-                          rewriter.getUnitAttr());
         bool writesOffsetZero = false;
         for (auto get : channelGets) {
           if (!areIdenticalVectors(
@@ -5433,12 +5431,12 @@ public:
                                              StringAttr dmaNameAttr,
                                              mlir::Value tileVal, int channel,
                                              int packetFlowId = -1) {
-    // Kernel-writes-header channels must not be statically stamped, so the
+    // Source-writes-header channels must not be statically stamped, so the
     // shim DMA does not prepend a second header word. Skip before the runtime
     // fallback below could tag it with an arbitrary flow id.
     if (auto ci = dyn_cast_if_present<air::ChannelInterface>(
             memcpyOpIf.getOperation()))
-      if (air::channelKernelWritesHeader(
+      if (air::channelSourceWritesHeader(
               air::getChannelDeclarationThroughSymbol(ci)))
         return success();
 
@@ -6635,13 +6633,13 @@ public:
     AIE::PacketInfoAttr pktInfoAttr = nullptr;
     if (auto chanIfOp = dyn_cast_if_present<air::ChannelInterface>(
             memcpyOp.getOperation())) {
-      // Channels whose kernel writes the routing header itself must NOT be
-      // statically stamped: a static pkt_id would prepend a second header word
-      // and shift the payload.
-      bool kernelWritesHeader = air::channelKernelWritesHeader(
+      // Channels whose SOURCE writes the routing header must NOT be statically
+      // stamped: a static pkt_id would prepend a second header word and shift
+      // the payload.
+      bool srcWritesHeader = air::channelSourceWritesHeader(
           air::getChannelDeclarationThroughSymbol(chanIfOp));
       auto it = packetIDForChannelName.find(chanIfOp.getChanName().str());
-      if (!kernelWritesHeader && it != packetIDForChannelName.end())
+      if (!srcWritesHeader && it != packetIDForChannelName.end())
         pktInfoAttr =
             AIE::PacketInfoAttr::get(ndcpy->getContext(), 0, it->second);
     }
