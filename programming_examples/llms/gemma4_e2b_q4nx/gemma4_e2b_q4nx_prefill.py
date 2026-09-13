@@ -303,12 +303,14 @@ def _gemm_externs(spec):
 
 
 def _wT(w, k_dim, n_dim):
-    """A bundle weight as the (K, N) operand the GEMM wants.
+    """A bundle weight as the (K, N) bf16 operand the GEMM wants.
 
     Q4nxModel.dequant returns every projection as (out, in) -- the HF layout,
     which forward_prompt consumes as `x @ w.T`. The GEMMs here take (in, out),
     so this is a TRANSPOSE, not a reshape: reshaping a (4096, 1536) array to
     (1536, 4096) is silent and wrong.
+
+    Called once per weight at load time, not per dispatch -- see _transpose_all.
     """
     a = np.ascontiguousarray(np.asarray(w, bfloat16).T)
     assert a.shape == (k_dim, n_dim), (a.shape, (k_dim, n_dim))
@@ -329,22 +331,19 @@ def _gemm_amap(inp, w, out, sc):
 # The attention input, SPLIT into two ELFs.
 #
 # The shared 8-launch builder (rms_qkv_qknorm_rope_multi) stitches Q, K and V
-# into one ELF, and every model that uses it has a q_dim and a kv_dim that land
-# on the same GEMM method AND the same tile_n. Gemma4 does not: q_dim is 2048 or
-# 4096 (fused-cast, tile_n=128) while kv_dim is 256 or 512 (drain, tile_n=64,
-# because N=256 cannot give the herd's 4 columns a 128-wide tile).
+# into ONE ELF. Gemma4 cannot use it: MORE THAN ONE GEMM PER ELF MISCOMPILES
+# here, silently, as partial NaN. Measured on device at seq=2048, layer 0, with
+# every arm repeated:
+#   Q + K/V in one ELF (mixed methods)  -> Q cos 0.99993, K/V all-NaN
+#   all three GEMMs one method          -> K/V cos 0.9995, Q partial-NaN
+#   K and V alone together in one ELF   -> NaN on 2 of 4 repeats, clean on 2
+#   one GEMM per ELF                    -> clean on 4 of 4, every class
+# So it is not the method and not the shape -- a second GEMM slice in the same
+# ELF is enough. Q, K and V therefore get one ELF EACH. Every other ELF in this
+# file already holds exactly one GEMM; keep it that way.
 #
-# Stitching those together MISCOMPILES -- silently, as partial NaN in whichever
-# GEMMs are in the minority. Measured on device at seq=2048, layer 0:
-#   Q fused-cast tn=128 + K/V drain tn=64  -> Q cos 0.99993, K/V all-NaN
-#   all three drain tn=64                  -> K/V cos 0.9995, Q partial-NaN
-#   the same K/V GEMM alone in its own ELF -> cos 0.999851
-# So neither method is at fault and neither shape is; the mixture is. Q and K/V
-# therefore get one ELF each. K and V keep sharing one, which is safe because
-# they are the same shape as each other.
-#
-# The split pays for itself anyway: the 20 KV-shared layers now skip the K/V
-# dispatch outright instead of running it against zero weights.
+# The split pays for itself anyway: the 20 KV-shared layers now skip the K and V
+# dispatches outright instead of running them against zero weights.
 # ---------------------------------------------------------------------------
 
 
@@ -966,9 +965,22 @@ class Gemma4Q4nxPrefill:
         # would otherwise be silently reused (-> all-zero logits past its length).
         cache_dir = cache_dir or str(_HERE / f"_q4nx_cache_seq{seq_len}")
         self.cache = KernelCache(cache_dir=cache_dir, verbose=verbose)
+        # KernelCache keys on kernel NAME, and the manifest validates only the
+        # toolchain -- so a cache built at another seq_len would be reused here
+        # and dispatched with differently sized buffers. The default path
+        # carries the length, but --cache-dir / Q4NX_CACHE_DIR is taken
+        # verbatim, so stamp the length and refuse a mismatch.
+        self._seq_stamp = Path(cache_dir) / ".seq_len"
         self._verbose = verbose
 
         force = os.environ.get("Q4NX_FORCE_COMPILE") == "1"
+        if self._seq_stamp.is_file():
+            was = self._seq_stamp.read_text().strip()
+            if was != str(seq_len):
+                raise SystemExit(
+                    f"cache {cache_dir} was built for seq_len={was}, not "
+                    f"{seq_len}. Point --cache-dir elsewhere or remove it."
+                )
         if not force:
             self.cache.load_manifest()
         cached = set() if force else set(self.cache.artifacts)
@@ -977,6 +989,8 @@ class Gemma4Q4nxPrefill:
         else:
             print("[g4_prefill] using cached prefill ELFs (skip compile)", flush=True)
             self.scratch = resolve_scratch(seq_len)
+        self._seq_stamp.parent.mkdir(parents=True, exist_ok=True)
+        self._seq_stamp.write_text(str(seq_len))
 
         from shared.infra.backend_presets import LM_GEMV_BACKEND
 
@@ -1020,12 +1034,45 @@ class Gemma4Q4nxPrefill:
         print(f"[g4_prefill] loading weights from model.q4nx ({model})", flush=True)
         self._qm = qm = Q4nxModel(model)
         self._check_class_map(qm)
-        self._w = [qm.layer_weights(k) for k in range(self.n_layers)]
+        self._w = [
+            self._transpose_all(qm.layer_weights(k), k) for k in range(self.n_layers)
+        ]
         self._nm = [qm.layer_norms(k) for k in range(self.n_layers)]
-        self._ple = [qm.layer_ple(k) for k in range(self.n_layers)]
+        self._ple = [self._transpose_ple(qm.layer_ple(k)) for k in range(self.n_layers)]
         self._g = qm.globals()
         self._luts = rope_luts(self.seq, qm.rope_freqs())
         self._preload()
+
+    def _transpose_all(self, w, k):
+        """Every projection of one layer, transposed to (K, N) bf16 once.
+
+        The dispatch path used to call _wT on each weight on every layer of
+        every prefill, which re-materialized a contiguous transpose of up to
+        12288x1536 per call even though static_input_indices means the device
+        write is skipped. Doing it here also HALVES the host footprint: the
+        float32 arrays Q4nxModel.dequant returns are dropped on return.
+        """
+        _dh, dq, dkv = dims(k)
+        inter = wid_inter(_wid(k))
+        out = {
+            "q": _wT(w["q"], D, dq),
+            "o": _wT(w["o"], dq, D),
+            "gate": _wT(w["gate"], D, inter),
+            "up": _wT(w["up"], D, inter),
+            "down": _wT(w["down"], inter, D),
+        }
+        if owns_kv(k):
+            out["k"] = _wT(w["k"], D, dkv)
+            out["v"] = _wT(w["v"], D, dkv)
+        return out
+
+    def _transpose_ple(self, pw):
+        """The PLE matrices as the (K, N) operands their GEMMs want."""
+        return {
+            "inp_gate": _wT(pw["inp_gate"], D, PLI_D),
+            "model_proj": _wT(pw["model_proj"], D, PLI_D),
+            "per_layer_projection": _wT(pw["per_layer_projection"], PLI_D, D),
+        }
 
     def _check_class_map(self, qm):
         """The bundle, not this file, decides which layers are double-wide.
@@ -1079,7 +1126,7 @@ class Gemma4Q4nxPrefill:
             np.asarray(x_in, bfloat16).reshape(seq, D),  # 0 x_in (dynamic)
             np.asarray(nm["input"], bfloat16).reshape(D),  # 1 input_layernorm
             np.zeros((seq, D), bfloat16),  # 2 normed (out -> the K/V ELF)
-            _wT(self._w[k]["q"], D, dq),  # 3
+            self._w[k]["q"],  # 3
             np.zeros((seq, dq), bfloat16),  # 4 q
             np.asarray(self._q_norm_scaled(k), bfloat16).reshape(dh),  # 5 q_norm
             np.zeros((seq, dq), bfloat16),  # 6 q_n
@@ -1111,7 +1158,7 @@ class Gemma4Q4nxPrefill:
         name = K_K(_cls(k))
         args = [
             np.asarray(normed, bfloat16).reshape(seq, D),  # 0 normed (a real input)
-            _wT(self._w[k]["k"], D, dkv),  # 1
+            self._w[k]["k"],  # 1
             np.zeros((seq, dkv), bfloat16),  # 2 k
             np.asarray(nm["k_norm"], bfloat16).reshape(dh),  # 3
             np.zeros((seq, dkv), bfloat16),  # 4 k_n
@@ -1141,7 +1188,7 @@ class Gemma4Q4nxPrefill:
         name = K_V(_cls(k))
         args = [
             np.asarray(normed, bfloat16).reshape(seq, D),  # 0 normed
-            _wT(self._w[k]["v"], D, dkv),  # 1
+            self._w[k]["v"],  # 1
             np.zeros((seq, dkv), bfloat16),  # 2 v
             np.ones(dh, bfloat16),  # 3 value_norm -- WEIGHTLESS
             np.zeros((seq, dkv), bfloat16),  # 4 v_n (out)
@@ -1168,7 +1215,7 @@ class Gemma4Q4nxPrefill:
         nm = self._nm[k]
         args = [
             np.asarray(attn_out, bfloat16).reshape(seq, dq),  # 0
-            _wT(self._w[k]["o"], dq, D),  # 1 wo
+            self._w[k]["o"],  # 1 wo
             np.zeros((seq, D), bfloat16),  # 2 proj
             np.asarray(nm["post_attn"], bfloat16).reshape(D),  # 3
             np.zeros((seq, D), bfloat16),  # 4 proj_n
@@ -1199,7 +1246,7 @@ class Gemma4Q4nxPrefill:
         inter = wid_inter(_wid(k))
         args = [
             np.asarray(normed2, bfloat16).reshape(seq, D),
-            _wT(self._w[k][wkey], D, inter),
+            self._w[k][wkey],
             np.zeros((seq, inter), bfloat16),
         ]
         idx = {0, 2}
@@ -1332,21 +1379,21 @@ class Gemma4Q4nxPrefill:
                 k,
                 inter,
                 z_i,
-                _wT(w["down"], inter, D),
+                w["down"],
                 nm["post_ffn"],
                 z_d,
                 True,
                 {0: _A_ACT, 5: _A_RES1},
             )
-            self._call_ple_gemm(k, z_d, _wT(pw["inp_gate"], D, PLI_D), "gate")
-            self._call_ple_gemm(k, z_d, _wT(pw["model_proj"], D, PLI_D), "mp")
+            self._call_ple_gemm(k, z_d, pw["inp_gate"], "gate")
+            self._call_ple_gemm(k, z_d, pw["model_proj"], "mp")
             self._call_gelu_mul(K_PLE_GELU, k, PLI_D, z_p, z_p, None)
             self._call_gemm_norm_add(
                 K_PLE_PROJ,
                 k,
                 PLI_D,
                 z_p,
-                _wT(pw["per_layer_projection"], PLI_D, D),
+                pw["per_layer_projection"],
                 nm["post_ple"],
                 z_d,
                 False,
@@ -1409,7 +1456,7 @@ class Gemma4Q4nxPrefill:
                 self._call_ple_gemm,
                 L,
                 emb,
-                _wT(self._ple[L]["model_proj"], D, PLI_D),
+                self._ple[L]["model_proj"],
                 "mp",
                 tag="ple_mp",
             )[2].reshape(seq, PLI_D)
@@ -1477,7 +1524,7 @@ class Gemma4Q4nxPrefill:
             k,
             inter,
             act,
-            _wT(self._w[k]["down"], inter, D),
+            self._w[k]["down"],
             self._nm[k]["post_ffn"],
             res1,
             True,
@@ -1491,7 +1538,7 @@ class Gemma4Q4nxPrefill:
             self._call_ple_gemm,
             k,
             o2,
-            _wT(pw["inp_gate"], D, PLI_D),
+            pw["inp_gate"],
             "gate",
             tag="ple_gate",
         )[2].reshape(seq, PLI_D)
@@ -1504,7 +1551,7 @@ class Gemma4Q4nxPrefill:
             k,
             PLI_D,
             gated,
-            _wT(pw["per_layer_projection"], PLI_D, D),
+            pw["per_layer_projection"],
             self._nm[k]["post_ple"],
             o2,
             False,
@@ -1652,9 +1699,19 @@ def _main():
     top = int(logits.argmax())
     text = tok.decode([top]).strip()
     print(f"[g4_prefill] first-token argmax={top} {text!r} (expect {EXPECT_TEXT!r})")
-    ok = text == EXPECT_TEXT
-    print("[g4_prefill] *** PARIS ***" if ok else "[g4_prefill] MISS", flush=True)
+    paris = text == EXPECT_TEXT
+    print("[g4_prefill] *** PARIS ***" if paris else "[g4_prefill] MISS", flush=True)
+    # Only --gate makes a verdict. profile-prefill runs this same path for its
+    # TTFT numbers and is documented latency-only, so a missed argmax there must
+    # not become a non-zero exit and fail a sweep point.
+    ok = paris if args.gate else True
 
+    if args.gate and args.n_layers != NUM_LAYERS:
+        raise SystemExit(
+            f"--gate compares against forward_prompt, which always runs all "
+            f"{NUM_LAYERS} layers; --n-layers={args.n_layers} would score two "
+            f"different networks. Drop --n-layers or drop --gate."
+        )
     if args.gate:
         # argmax alone is a weak gate on this model: a doubled embedding scale
         # and a per-layer-embedding read from the wrong tensor BOTH still
@@ -1679,7 +1736,14 @@ def _main():
         if top != ref_top:
             print(f"[g4_prefill] FAIL: argmax {top} != reference {ref_top}")
             ok = False
-        if cos < args.tol:
+        # Reject non-finite BEFORE the floor. `nan < tol` is False, so a NaN
+        # cosine would otherwise pass the floor silently and leave the verdict
+        # resting on the argmax alone -- and NaN is this design's characteristic
+        # failure (see the one-GEMM-per-ELF note above).
+        if not np.isfinite(cos):
+            print(f"[g4_prefill] FAIL: cosine is {cos} (non-finite logits?)")
+            ok = False
+        elif cos < args.tol:
             print(f"[g4_prefill] FAIL: cosine {cos:.6f} below floor {args.tol}")
             ok = False
         print("[g4_prefill] GATE PASS" if ok else "[g4_prefill] GATE FAIL", flush=True)

@@ -5,8 +5,9 @@
 // through the AIR -> AIE -> aiecc -> Peano pipeline. No NPU dispatch and no
 // weight data (weights are runtime BOs), so this is the signal CI can always
 // give without the external Q4NX bundle. Pairs with run_npu2_compile.lit (the
-// decode half) and run_npu2_prefill_sweep.lit (the timed half, which does need
-// the weights).
+// decode half) and run_npu2_verify_prefill.lit (the on-device gate, which does
+// need the weights). There is no prefill sweep yet: only the 2048-row build has
+// been run, and a sweep would rebuild at lengths nothing has validated.
 //
 // TWENTY-TWO, not Gemma3-4B's eight, and that count is the model: Gemma4 crosses
 // two attention classes with two FFN widths, so every attention-shaped ELF is
@@ -26,8 +27,11 @@
 // Both attention classes by name, not just "it compiled": head_dim=512 is the
 // one shape no other model here builds, and a regression that dropped the full
 // layers back to 256 would otherwise leave this test green.
-// CHECK: rms_q_swa
-// CHECK: rms_q_full
-// CHECK: flash_attn_swa
-// CHECK: flash_attn_full
+// The DIMENSION, not just the kernel name: the log prints the head dim next to
+// each, so matching the bare name would stay green if the full-attention class
+// were rebuilt at 256.
+// CHECK: rms_q_swa {{.*}}dh=256
+// CHECK: rms_q_full {{.*}}dh=512
+// CHECK: flash_attn_swa {{.*}}head_dim=256
+// CHECK: flash_attn_full {{.*}}head_dim=512
 // CHECK: Compilation passed.

@@ -7,9 +7,9 @@
 # Prefill runs end to end on the NPU and is gated against the CPU reference
 # (`make compile-prefill`, `make prefill-paris`). The decoder layer runs on the
 # NPU too but is gated per LAYER (`make layer-gate`) rather than per token:
-# there is no token-level chatbot driver yet, so the `run` / `ask` / `verify` /
-# `profile` targets the other llms/ examples carry are deliberately absent
-# rather than present and broken.
+# there is no token-level chatbot driver yet, so the `run` / `ask` / `profile`
+# targets the other llms/ examples carry are deliberately absent rather than
+# present and broken.
 #
 # The device path is the fused_decode_ple engine (../../fused_decode_ple), a
 # fork of fused_decode carrying the per-layer-embedding branch this model needs.
@@ -31,10 +31,15 @@ PREFILL_DRIVER := $(srcdir)/gemma4_e2b_q4nx_prefill.py
 BUILD_DIR := build_peano
 
 # Padded prefill length. Every prefill ELF is built FOR this length, so changing
-# it is a rebuild, not a runtime knob -- which is the axis run_npu2_prefill_sweep
-# walks.
+# it is a rebuild, not a runtime knob. Only 2048 has been run; a prefill sweep
+# over other lengths is follow-up work.
 CTX ?= 2048
 export Q4NX_SEQ_LEN := $(CTX)
+
+# Kernel cache, UNDER THE DIRECTORY MAKE WAS INVOKED FROM. The lit tests each
+# run from their own build dir and each start with `make clean`; a cache shared
+# through $(srcdir) would let one test delete the other's ELFs mid-dispatch.
+export Q4NX_CACHE_DIR := $(CURDIR)/_q4nx_cache_seq$(CTX)
 
 # Weight source: HF repo id (model.q4nx bundle) or a local dir/file. Read by the
 # drivers as Q4NX_MODEL_SOURCE, exactly as in the other q4nx examples.
@@ -274,5 +279,5 @@ clean:
 	@$(MAKE) --no-print-directory -C $(DEC) clean
 	rm -rf $(srcdir)/__pycache__ $(srcdir)/build_peano $(srcdir)/build_chess 2>/dev/null || true
 	rm -f $(srcdir)/*.npz $(srcdir)/decode_L*.xclbin $(srcdir)/decode_L*.insts.bin 2>/dev/null || true
-	rm -rf $(srcdir)/_q4nx_cache_seq* $(srcdir)/build_peano 2>/dev/null || true
+	rm -rf $(srcdir)/_q4nx_cache_seq* $(CURDIR)/_q4nx_cache_seq* $(srcdir)/build_peano 2>/dev/null || true
 	@echo "Gemma4 caches and the PLE decode build removed."
