@@ -425,6 +425,21 @@ jobs:
             LIT_OPTS="--timeout 3600" \
               ninja check-programming-examples-llms-prefill-sweep || rc=1
           fi
+          # #1984 diagnostic. NOT part of the schedule and never publishes --
+          # dispatch this branch with suites=probe. It measures the two things
+          # the nightly cannot: the per-dispatch hang rate at depth 1 with the
+          # layer gate's retries DISABLED (the gate allows 24 attempts, so its
+          # green says nothing about the rate), and whether the same full-depth
+          # dispatch survives with the PLE arm compiled out.
+          if want probe; then
+            # PEANO_INSTALL_DIR is set in the BUILD step and does not survive
+            # into this one (it never reached $GITHUB_ENV); the lits get it as a
+            # lit substitution baked in at CMake configure time, which a plain
+            # `make` cannot see. Recompute it the same way the build step does.
+            PROBE_PEANO=$(python3 -m pip show llvm-aie | grep ^Location: | awk '{print $2}')/llvm-aie
+            PROBE_G=$GITHUB_WORKSPACE/programming_examples/llms/gemma4_e2b_q4nx
+            bash "$PROBE_G/probe_1984.sh" "$PROBE_G" "$PROBE_PEANO" 20 || true
+          fi
           popd
           exit $rc
 
