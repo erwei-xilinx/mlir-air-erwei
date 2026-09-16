@@ -2,84 +2,123 @@
 
 ## The one thing to read first
 
-**Fleet is documented as MI350 (gfx950) only.** README line 1: "a cooperative
-task scheduling system for LLM inference on AMD MI350 GPUs". Hardware
-Requirements: "AMD Instinct MI350 (gfx950), 248 CUs in 8 XCDs, 4 MB L2 per XCD,
-ROCm 7.0+". `grep -i "mi300\|gfx942"` over README.md, INSTALL.md and docs/
-returns **nothing**.
+**Fleet runs. All three README modes, on MI350X, `rc=0`.** Getting there took
+one fact: the pinned `composable_kernel` revision, which was in the clone the
+whole time on a non-squashed branch. See "The dependency pin".
 
-I spent a long stretch trying to build it on MI300X (gfx942) before reading
-that. The `--offload-arch=gfx950` default in `persistent_kernel.py:350` is not
-a bug, it is the target. Everything in the "MI300X attempt" section below is
-therefore a story about the wrong platform.
+Two claims in earlier versions of this file were wrong and are corrected below:
 
-The cluster has MI350: partition `mi350x-es`, nodes
-`smci350-rck-g03-d13-21` (idle) and `smci350-rck-g03-f13-21` (inval).
+- *"There are no pinned dependency revisions."* There are --
+  `git fetch origin && git ls-tree origin/aid-local-weights-v2 deps/`.
+- *"The CK problem is MI300X-specific; gfx950 builds clean."* It is not. The
+  package builds, but the **megakernel is compiled at runtime by hipcc** and
+  that failed identically on both platforms until the CK was right.
 
-## Numbers so far
+Fleet is still documented MI350-only -- README line 1, "AMD MI350 GPUs";
+Hardware Requirements "gfx950 ... ROCm 7.0+"; `grep -i "mi300\|gfx942"` over
+README/INSTALL/docs returns nothing. But the reason MI300X failed was the CK
+revision, not the architecture, so that is now worth retrying.
 
-| | | |
-|---|---|---|
-| Fleet torch baseline, MI300X | Qwen3-0.6B decode | **26.57 ms/token** |
-| AIR chain (this repo), MI300X | Qwen3-0.6B decode | **~6.4 s/token** |
-| Fleet MPK megakernel | — | **builds on MI350**; run blocked on node faults |
+## Numbers so far -- ALL FOUR MEASURED, 2026-09-16
 
-**These first two are now the same quantity.** The AIR chain decodes (NEXT.md
-§2.9), so this is per decoded token on both sides, same GPU, same model, same
-weights: **the AIR chain is about 240x slower than the HF torch baseline.**
-Why is already recorded in NEXT.md §5 -- one thread per workgroup -- and is not
-this work's priority.
+Qwen3-0.6B, per decoded token. Fleet's own `demo/qwen3/demo.py` for the first
+four rows; `--max-num-batched-tokens 1` makes every MPK iteration a single
+token, so prefill and decode cost the same and the number is a true per-step
+latency, comparable with the torch row.
 
-Measured by the slope over `REPEAT`, which isolates the device from the
-one-off cost of reading three gigabytes off NFS and running the host
-reference. Every slope below came from 2-3 points and each was re-run and
-reproduced to within 1%:
+| what | GPU | dtype | ms/token | vs torch |
+|---|---|---|--:|--:|
+| Fleet `mirage_mpk` | MI350X | bf16 | **2.431** | 4.3x faster |
+| Fleet `fleet_msplit` | MI350X | bf16 | 2.556 | 4.1x faster |
+| Fleet `fleet` M-tile | MI350X | bf16 | 2.591 | 4.0x faster |
+| torch / HF eager | MI350X | bf16 | **10.48** | 1x |
+| AIR (this repo) | MI300X | f32 | **6 370** | 610x slower |
+| AIR (this repo) | MI350X | f32 | **28 700** | 2 740x slower |
 
-| prompt | window | steps | device s/launch |
-|--:|--:|--:|--:|
-| 5 | 5 | 1 | 8.37 |
-| 10 | 10 | 1 | 16.20 |
-| 5 | 5 | 2 | 36.88 |
-| 10 | 5 | 2 | 60.87 |
-| 5 | 5 | 6 | 62.36 |
+torch was repeated three times: 10.420 / 10.275 / 10.515, spread 2.3%. An
+earlier 16.52 for the same command is discarded -- its node occupancy was not
+recorded and cannot be shown to be clean.
 
-**Two readings, one of them unexplained.**
+**Two results that do not match the README, both with a caveat I did not
+resolve:**
 
-1. *Within one step the cost is exactly linear in tokens*: 5 -> 10 tokens takes
-   8.37 -> 16.20 s, a factor of 1.94. About **1.6 s per token position**.
-2. *Splitting the same work across steps costs 3.8x*: ten token positions cost
-   **16.20 s in one step and 60.87 s in two**. Identical arithmetic, identical
-   weights, 3.8x apart. Rows 3, 4 and 5 are all within a few percent of 3.8x
-   their single-step equivalents, so it is a one-time penalty for `steps > 1`
-   rather than a per-step cost.
+1. *Both Fleet modes are 5-7% SLOWER than plain Mirage MPK here.* The README
+   claims Fleet M-tile is 1.13x faster -- but on **Qwen3-8B**, a model 13x
+   larger. Each of my three numbers is a single sample, and the node was
+   taken over by other users' jobs before I could repeat them. **Unsettled.**
+2. *AIR is 4.5x slower on MI350X than on MI300X*, which is the wrong
+   direction. Five other jobs were on the node throughout. Also unsettled;
+   the MI300X number is the more trustworthy of the two.
 
-**I do not know what causes (2), and did not guess in public.** Two hypotheses
-were tested and both failed: the kernel is not being specialised for the
-single-trip step loop (the gpu.module is 3493 vs 3494 lines for steps 1 and 2),
-and no device loop is bounded by anything that grows with `steps`. A
-per-stage-barrier model does not fit either -- it would need ~174 ms per
-barrier to explain row 4, and rows 1 and 2 bound the barrier cost at ~2 ms.
+AIR's numbers come from the `--repeat` slope (intercept 132.4 s):
+launch at 2 steps 82.4 s, at 6 steps 197.2 s, so 28.7 s per decode step.
+Correctness held on gfx950: 28 layers, chain and an independent numpy Qwen3
+both produce `12095,13,576,6722,315,15344` = " Paris. The capital of Italy".
 
-Settling it needs in-kernel timing, which is **currently broken**: `mgpuEventRecord`
-records on a stream `gpu-to-llvm` does not launch the kernel on, so
-`mgpuEventElapsedTime` returns `hipErrorInvalidHandle` (NEXT.md §5;
-`test/gpu/4k_4k_mul` has been printing this error all along). Fleet solves the
-same problem with `s_memrealtime` accumulators behind `MPK_DEVICE_TIMING`,
-which is the cheaper thing to copy.
+## Where the AIR gap actually is: the gfx950 ISA diff
 
-**The number to quote is the multi-step one.** The 8.34 s/launch in the earlier
-version of this file was the `steps = 1` row, and at 1.67 s/token it is
-optimistic by that same 3.8x for anything that actually decodes.
+Both lowered to gfx950 assembly and compared. AIR via
+`gpu-module-to-binary{format=isa}`, Fleet via `hipcc --cuda-device-only -S`.
+Saved as `fleet-artifacts/megakernel/{air,fleet}.s`.
 
-Why the AIR chain is slow is already recorded in NEXT.md §5: **one thread per
-workgroup**, so 32 workgroups x 1 thread = 32 threads. 5.97 GFLOP in 8.34 s is
-0.72 GFLOP/s against ~163 TFLOP/s of fp32 peak. f32-vs-bf16 and no matrix cores
-explain some of it; the thread count explains most.
+**Identical in both -- the scheduling and coherence layer is a faithful
+reproduction, not an approximation:**
 
-Measured with `--repeat` R = 1, 3, 5 -> 21.98 / 38.60 / 55.34 s wall. Slope is
-the per-launch device cost, 8.34 s; intercept 13.6 s is reading 3 GB of weights
-off NFS plus the single-threaded host reference. In-kernel timing is still
-unavailable (`mgpuEventElapsedTime` returns `hipErrorInvalidHandle`, NEXT.md §5).
+| | AIR | Fleet |
+|---|--:|--:|
+| `s_getreg_b32 HW_REG_XCC_ID` | 2 | 6 |
+| `buffer_wbl2` | 40 | 410 |
+| `buffer_inv` | 40 | 268 |
+
+**Different -- and this is the whole gap:**
+
+| | AIR | Fleet |
+|---|--:|--:|
+| `v_mfma_f32_16x16x32_bf16` | **0** | 64 |
+| `ds_write_b128` / `ds_read_b128` | **0 / 0** | 94 / 130 |
+| `s_barrier` | **0** | 36 |
+| `v_cmp_eq_u32 vcc, 0, v0` (tid==0) | **57** | 6 |
+
+The same matmul, side by side. Fleet (`fleet.s` near line 17496):
+
+```
+ds_write_b128 v29, v[92:95] offset:8816      ; stage the tile into LDS
+s_barrier                                     ; whole workgroup
+ds_read_b128  v[54:57], v169 offset:8688
+v_mfma_f32_16x16x32_bf16 a[0:3], v[54:57], v[88:91], a[0:3]
+```
+
+AIR (`air.s`, `.LBB0_250`):
+
+```
+global_load_dword v13, v[30:31], off nt       ; one HBM access per weight element
+global_load_dword v42, v[32:33], off offset:-4096 nt
+v_mul_f32_e32 / v_add_f32_e32                 ; scalar, exec mask = 1 lane
+```
+
+MACs per instruction: Fleet `v_mfma_f32_16x16x32_bf16` = 16*16*32 = **8192**;
+AIR `v_fma_f32` under a one-lane exec mask = **1**. That 8192x splits into
+**64x** from the exec mask and **128x** from MFMA-vs-scalar. The measured
+end-to-end gap (~2600x on MI300X) sits below that ceiling because the AIR
+chain is memory-bound, not issue-bound.
+
+**Ranked fix, and how to verify each without running the model:**
+
+| | change | expected | ISA check |
+|---|---|--:|---|
+| 1 | move task bodies from `air.segment` into `air.herd` | ~64x | `v_cmp_eq_u32 vcc,0,v0` falls from 57 |
+| 2 | stage tiles through LDS + `s_barrier` | cuts HBM traffic | `ds_read_b128`/`ds_write_b128` leave 0 |
+| 3 | bf16 through the matrix core | ~128x | `v_mfma` leaves 0 |
+
+Step 1 is a precondition: without multiple threads there is nothing to put in
+LDS and MFMA is a wavefront-level instruction. **The three ISA counters are a
+progress bar** -- recompile and count, two orders of magnitude faster than a
+28-layer run.
+
+One honest non-match: AIR emits 74 `global_load_dword ... nt`; Fleet emits
+**0 in this batch-1 build** (its `nt` weight loads live in the
+`gang_ksplit`/`gang_moe` paths, not compiled here). So AIR's `nt` use cannot
+be said to agree with Fleet's -- there is nothing to compare against here.
 
 ## What the README says to run
 
@@ -115,9 +154,12 @@ in NEXT.md §2.4.
    `pip install torch --index-url .../rocm6.4` gives torch 2.9.1+rocm6.4, which
    works on ROCm 7.2.3 (`torch.cuda.is_available()` true, "AMD Instinct
    MI300X"). The wheel carries its own ROCm userspace.
-2. **The Fleet snapshot is a single squashed commit with no submodule
-   gitlinks**, so there are no pinned dependency revisions to restore and every
-   version is a guess. json, z3, cutlass, composable_kernel all cloned by hand.
+2. ~~**The Fleet snapshot is a single squashed commit with no submodule
+   gitlinks**, so there are no pinned dependency revisions and every version is
+   a guess.~~ **WRONG, and it cost most of a day.** The `amd_mi350` branch is
+   squashed, but the same remote has three other branches that all carry the
+   gitlinks and all agree. One `git fetch origin` away. See "The dependency
+   pin" below.
 3. `src/search/search_context.cc:34` does not compile: `SearchLevel` has no
    serializer, so unqualified `from_json(j, c.level)` finds only the
    `SearchContext` overload in that namespace, and nlohmann's generic enum
@@ -217,28 +259,62 @@ clash as on MI300X and the same fix -- `LD_PRELOAD=/opt/rocm/lib/libhsa-runtime6
 skips the build (the editable install persists) and runs the torch baseline
 plus all three README modes.
 
-**With LD_PRELOAD the import succeeds and the next failure is the hardware:**
+**With LD_PRELOAD the import succeeds and the next failure is:**
 
 ```
 RuntimeError: No HIP GPUs are available
 ```
 
-Not a torch-vs-gfx950 problem -- `strings libtorch_hip.so` lists **gfx950**, and
-the wheel is 2.9.1+rocm6.4. It is the node. Minutes later:
+**I first wrote this up as a hardware fault. That was wrong.** The probe job
+(71830, `/shared/erweiw/probe350.sbatch`) settled it:
 
-```
-$ sinfo -p mi350x-es -o "%n %T %E"
-smci350-rck-g03-f13-21  inval   gres/gpu count reported lower than configured (0 < 8)
-smci350-rck-g03-d13-21  mixed-                     # trailing '-' = draining
-```
+| probe | result |
+|---|---|
+| A: torch alone, **no** preload | `No HIP GPUs are available` |
+| B: torch alone, **with** preload | `No HIP GPUs are available` |
+| C: torch then mirage, with preload | same |
+| D: torch then mirage, no preload | `libamdhip64.so.7: undefined symbol: hsa_amd_...` |
+| E: torch's own hsa-runtime preloaded | same as D |
 
-Both MI350 nodes in this cluster are unhealthy: one reports zero of its eight
-GPUs, and the one that did the build is draining. **So the Fleet MPK number is
-blocked on hardware availability, not on anything in Fleet or in the
-toolchain.** `/shared/erweiw/probe350.sbatch` (job 71830) is queued and will
-run the moment a node comes back -- it tries torch with and without the
-preload, and torch-then-mirage both ways, so it settles which combination
-works in one shot before spending 40 minutes on a demo.
+Row A is the one that matters: **bare torch, no environment tricks at all,
+already cannot see the card.** And on the same node in the same job,
+`rocm-smi` reports it fine -- `Card Series: AMD Instinct MI350X`, model
+`0x75a0` -- while slurm has the node `State=IDLE`, `Gres=...:8`,
+`Reason=none`.
+
+**So it is a version problem, not a hardware one.** The venv carries **torch
+2.9.1+rocm6.4** and the node is **gfx950 / ROCm 7.2.1**. gfx950 needs ROCm 7.x;
+torch's bundled 6.4 userspace does not enumerate the card. D and E add the
+other half: mirage links `/opt/rocm-7.2.1`'s `libamdhip64`, torch brings 6.4's
+hsa-runtime, and no preload reconciles them -- on MI300X it could, because
+gfx942 is supported in 6.4 either way.
+
+**Three things I got wrong and the evidence that corrects them:**
+
+1. *"Both MI350 nodes are unhealthy."* Only `f13-21` is, and for that one the
+   evidence is hard: `State=IDLE+DRAIN+INVALID_REG`,
+   `Reason=gres/gpu count reported lower than configured (0 < 8)`, flagged by
+   slurm since 2026-09-15. `d13-21` has been healthy throughout.
+2. *"`mixed-` means draining."* Not checked before being used as a conclusion.
+   It was the transient state while job 71763 sat in `CG`. `scontrol show node`
+   says `State=IDLE`.
+3. *"`strings libtorch_hip.so` lists gfx950, so torch supports it."* That is the
+   compile-time code-object list. It says nothing about whether the runtime
+   ROCr can enumerate the device, which is exactly what fails.
+
+**The fix, and the job that tries it:** put a torch built for ROCm 7.2 in the
+same venv, which for the first time also puts torch and mirage on the same
+ROCm userspace. `download.pytorch.org/whl/` carries `rocm7.2`.
+`/shared/erweiw/fleet350c.sbatch` (job 72054) does the install, refuses to go
+on unless `torch.cuda.get_device_name(0)` works **and** `import torch, mirage`
+survives together, and only then runs the torch baseline plus all three README
+modes.
+
+Reversal, if the new torch breaks the MI300X baseline:
+
+```bash
+pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/rocm6.4
+```
 
 **Neither of the two local patches was needed for the architecture.** They were
 needed to build the package at all, on either platform.
@@ -258,6 +334,69 @@ squeue -u erweiw
 
 QOS rejects `--time=03:00:00` / `--cpus-per-task=64`; 2 h and 32 cpus is
 accepted.
+
+## The dependency pin -- the thing that unblocked everything
+
+Every composable_kernel failure, on **both** MI300X and MI350, was one cause:
+the wrong CK. The pin was in the clone the whole time.
+
+```bash
+cd fleet-chiplet-megakernel && git fetch origin
+git ls-tree origin/aid-local-weights-v2 deps/
+```
+```
+160000 commit d8ee107a47d8485dbcffc79eb08e4f7c39ea6335  deps/composable_kernel
+160000 commit f3fde58372d33e9a5650ba7b80fc48b3b49d40c8  deps/cutlass
+160000 commit 8c391e04fe4195d8be862c97f38cfe10e2a3472e  deps/json
+160000 commit f9176fb4b72156bb8ceca7ebe1b817d9e87baf85  deps/z3
+```
+
+`amd_mi350` (what HEAD points at) is squashed and has no gitlinks;
+`aid-local-weights-v2`, `amd_mi355_gpt_oss120b` and `fleet-mk-vllm-0.27` all
+have them and all three agree. `git submodule status` is empty and
+`.gitmodules` only gives URLs -- that is what fooled me.
+
+It fits exactly. Fleet passes **14** template arguments to
+`TileFmhaFwdSplitKVTraits`; rocm-7.1.1 and the node's ROCm 7.2.1 both declare
+**13**. At `d8ee107a` the 14th exists:
+
+```cpp
+          index_t kBlockPerCu_             = -1,
+          bool kHasSink_                   = false>   // the 14th
+struct TileFmhaFwdSplitKVTraits
+```
+
+With it: `hipcc rc=0`, **0 errors**, down from 20. The CK-tag table further
+down is a record of a search that should never have happened -- the answer was
+not in any released tag because it is a `rocm-libraries` revision.
+
+**Do not edit the call site to drop the extra argument.** I considered it; it
+would have silently removed a sink-attention flag from the kernel being
+benchmarked.
+
+## The runtime environment that works
+
+- ROCm 7.2.1 on the node, gfx950
+- **torch 2.14.0+rocm7.2** (`--index-url https://download.pytorch.org/whl/rocm7.2`)
+  installed into `/shared/erweiw/venv-torch`, replacing 2.9.1+rocm6.4
+- **No `LD_PRELOAD`.** Once torch and mirage share the ROCm 7.2 userspace the
+  `hsa_amd_memory_get_preferred_copy_engine` clash is gone.
+- Reverse with:
+  `pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/rocm6.4`
+
+torch 2.9.1+rocm6.4 **cannot see an MI350X at all** (`No HIP GPUs are
+available`) while `rocm-smi` on the same node reports the card fine. gfx950
+appearing in `strings libtorch_hip.so` is the compile-time code-object list and
+says nothing about runtime enumeration -- I used it as evidence once; it is not.
+
+## Artifacts
+
+`/shared/erweiw/fleet-artifacts/` -- survives node and allocation loss:
+`README.md` (pins + stack), `env/deps-pins.txt`, `sbatch/` (all six job
+scripts), `logs/` (three modes, full output), `megakernel/test.cu` (what Fleet
+generated), `megakernel/{air,fleet}.s` (the gfx950 ISA of both),
+`hipcc-ok.log` vs `hipcc-wrong-ck.log` (0 errors vs 20, for whoever hits this
+next).
 
 ## Local modifications to the vendored snapshot
 
