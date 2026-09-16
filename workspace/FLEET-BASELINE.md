@@ -32,8 +32,14 @@ latency, comparable with the torch row.
 | Fleet `fleet_msplit` | MI350X | bf16 | 2.556 | 4.1x faster |
 | Fleet `fleet` M-tile | MI350X | bf16 | 2.591 | 4.0x faster |
 | torch / HF eager | MI350X | bf16 | **10.48** | 1x |
-| AIR (this repo) | MI300X | f32 | **6 370** | 610x slower |
-| AIR (this repo) | MI350X | f32 | **28 700** | 2 740x slower |
+| AIR, before this work | MI300X | f32 | 10 430 | 1 000x slower |
+| AIR, **now** | MI300X | f32 | **153.0** | 15x slower |
+| AIR (as measured earlier) | MI350X | f32 | 28 700 | 2 740x slower |
+
+The AIR row moved by **68x** on 2026-09-16; see "Closing the gap" below for
+what did it and what did not. The 10 430 and the 153.0 are the same node
+minutes apart, so they are comparable to each other; the older 6 370 in
+previous versions of this table was a different session and is superseded.
 
 torch was repeated three times: 10.420 / 10.275 / 10.515, spread 2.3%. An
 earlier 16.52 for the same command is discarded -- its node occupancy was not
@@ -119,6 +125,93 @@ One honest non-match: AIR emits 74 `global_load_dword ... nt`; Fleet emits
 **0 in this batch-1 build** (its `nt` weight loads live in the
 `gang_ksplit`/`gang_moe` paths, not compiled here). So AIR's `nt` use cannot
 be said to agree with Fleet's -- there is nothing to compare against here.
+
+## Closing the gap: 10 430 -> 153 ms/token, 2026-09-16
+
+Step 1 of the ranked fix above landed; steps 2 and 3 did not, and the reason
+is that step 1 changed which thing is the limit. Commits on
+`erwei/fix-gpu-conversion-passes`, tip `79791a4a`.
+
+| | ms/token | note |
+|---|--:|---|
+| before | 10 430 | everything under `scf.if %isLead`, one lane in 64 |
+| + task bodies on the whole wavefront | 217.4 | `230050fe` |
+| + workers and tasks 32 -> 128 | **153.0** | `79791a4a` |
+| Fleet, for scale | 2.431 | MI350X, bf16 |
+
+**What step 1 actually needed.** The guard came off the bodies and went onto
+the protocol. The claim and the signal stay on the lead lane, because the
+scheduler counts workgroups -- the queue hands out one piece per workgroup and
+the two-level flush compares its arrivals against `air.chiplet_dim_blocks` --
+and the claim reaches the other 63 lanes through `rocdl.readfirstlane`, which
+is sound only because `air.herd` is 1x1 and so the block is exactly one wave.
+The matmuls, the embed gather, SwiGLU and the lm head then stride their output
+loop from the lane id; the three rmsnorms and the attention softmax need a
+cross-lane step and get a six-deep `gpu.shuffle` butterfly. `gpu.subgroup_reduce`
+says that in one op but **nothing in the pipeline lowers it** -- the patterns
+exist only behind `--test-gpu-subgroup-reduce-lowering`.
+
+`v_cmp_eq_u32 vcc, 0, v0` went 50 -> 2, which is what the table above
+predicted. But that counter saturates: it reads the same 2 whether one body is
+spread or all of them, so it cannot tell you how far you got. What can:
+putting a body back on the lead lane while keeping its strided loop leaves the
+rest of every slice unwritten, and the host comparison says 383.
+
+**Two things that were expected to matter and did not.**
+
+*The poll loop.* Every stage boundary spun on an acquire load, which on gfx950
+is `buffer_inv` -- the whole CU's vector cache, discarded, at full issue rate,
+1512 times a launch. Fleet polls relaxed and fences once after the wait
+(`persistent_kernel.cuh:944-966`) and backs off with `s_sleep` (:959). Making
+AIR do the same measured **1.4% worse**: 221.9 / 219.6 against 217.4 / 217.5,
+both changed runs above both unchanged ones. Reverted in `c63e34bf`. The
+theory misses because at 32 workgroups on 304 CUs a workgroup has its CU to
+itself, so there is no neighbour whose cache `buffer_inv` could be costing.
+Worth redoing if occupancy ever gets high.
+
+*Steps 2 and 3, for now.* After step 1 the chain sustains ~0.07% of the FMA
+issue rate its waves could manage and ~0.2% of HBM bandwidth. Neither issue
+nor bandwidth is the limit, so neither LDS staging nor MFMA is the next lever
+-- **latency is**, and the fix for latency is more waves in flight.
+
+**Occupancy is the current limit.** A stage has `tasks` pieces when a step
+carries one token, so `tasks` bounds how many workgroups can be doing
+anything, and each workgroup is one wavefront:
+
+| workers / tasks | ms/token |
+|---|--:|
+| 32 / 32 | 227.0 |
+| 64 / 64 | 179.1 |
+| **128 / 128** | **153.0** |
+| 256 / 128 | 261.1 |
+
+The last row is the shape of the cost: a workgroup that finds no piece does
+not exit, it spins on every remaining event for the rest of the launch. Keep
+workers equal to tasks. 128 is this checkpoint's ceiling rather than an
+optimum -- `tasks` has to divide every stage width and the vocabulary is
+151936 = 128 * 1187.
+
+**So the next lever is waves per workgroup, not MFMA.** A wider `air.herd`
+(4x1 gives 256 threads, four waves) multiplies occupancy without needing more
+pieces, and it is the same change that step 2 needs: with more than one wave
+per block, `rocdl.readfirstlane` no longer reaches the whole block and the
+claim has to be broadcast through LDS. That single change unlocks the LDS
+staging of step 2 and the `s_barrier` that goes with it.
+
+### Measuring this at all
+
+Two-point slopes over `--repeat` have a ~2 s noise floor against a fixed cost
+of ~69 s (three gigabytes of weights off NFS, plus the single-threaded host
+reference). At `1 -> 3` launches the signal is ~1.4 s and **the measurement is
+worthless** -- it produced a 55.0 ms/token that did not reproduce and a 229.7
+from the same snapshot minutes later. At `1 -> 9` the spread between repeats
+is under 1%. `workspace/bench.sh` does the wide version, always runs from a
+snapshot of the generator (editing it mid-run silently gives the two halves of
+a measurement two different programs -- that happened once), and logs
+`squeue -w $(hostname)` around every measurement.
+
+`workspace/isa.sh` is the other half: it compiles the generated chain to gfx950
+assembly and counts these instructions in **0.6 s**, no GPU involved.
 
 ## What the README says to run
 
