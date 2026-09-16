@@ -4,13 +4,15 @@
 > 论文头条结果(信号削减)定量复现:device-scope 原子数 = die 数 × stage 数,
 > **与 worker 数无关**,所以削减比 = 每 die 的 worker 数(实测 2× / 4× / 8× / 16× / 32×)。
 >
-> **36 个本地 commit,都没 push**(分支 `erwei/fix-gpu-conversion-passes`)。
-> 工作区干净,`workspace/` 保持 untracked、没进分支。
-> 最后一次全量:**GPU 执行测试 17/17 exit 0**,lit **310 过 / 240 挂**
+> **37 个 commit,已 push 到 `erwei-xilinx/mlir-air-erwei` 分支
+> `erwei/fix-gpu-conversion-passes`**;交接文档在 `erwei/air-gpu-notes`。
+> 工作区干净,`workspace/` 在代码分支上保持 untracked。
+> 最后一次全量:**GPU 执行测试 18/18 exit 0**,lit **310 过 / 240 挂**
 > (240 全是 AIE 关闭所致,与 GPU 路径无关)。
 >
-> **真实 Qwen3-0.6B 权重已在 MI300X 上跑通**,28 层,产出的 token 与独立 numpy 实现
-> 逐个相同(`"The capital of France is"` → `" Paris"`)。见 §2.8。
+> **真实 Qwen3-0.6B 已在 MI300X 上真正解码**,28 层,一次 launch 六个 step,
+> 产出的 token 与独立 numpy 实现逐个相同:
+> `"The capital of France is"` → `" Paris. The capital of Italy"`。见 §2.9。
 >
 > 历史过程记录在 `workspace/NEXT.history.md`(本文件的旧版,按时间叠加)。
 
@@ -163,11 +165,17 @@ flush 恒为 **56 = 8 die × 7 strided stage × 1 层**,全部 0 错。
 `--tokens M` 给整条链加了 batch 维。激活加 token 维,**权重和 KV cache 不加** ——
 这个不对称就是 M-major 的理由:一个权重块值得读一次用 M 次。
 
-die 领第 k 个 piece 时的分解(Fleet `gang_linear_mi300.cuh:75`,全 M-major):
+die 领第 k 个 piece 时的分解(Fleet `gang_linear_mi300.cuh:60-77`):
 
 ```
 m = k % tokens          n = die + (k / tokens) * maxdies
 ```
+
+> **订正(这次读代码发现的)**:Fleet 的 M-major 不是全 M-major,是 **HipKittens
+> Algorithm 1 的窗口式遍历**:窗口高 `W = wgm`(`wgm<=0 || wgm>=m_tiles` 时取
+> `m_tiles`),`m_tile = first_row + local % win_h`、`n_tile = local / win_h`。
+> **我实现的是 `W = m_tiles` 那个退化情形。**目前 `--tokens` 都很小(≤5),
+> `wgm` 没有意义,但"全 M-major"是特例不是通例,别照抄。
 
 套在 **die 自己的 claim 计数器**上(不是全局 tile id),因为那个计数器才是一个 die
 的 workgroup 共享的东西。**M=1 时退化成 `m=0, n=k`,正是原来的式子** ——
@@ -327,6 +335,75 @@ QWEN_DIR=/shared/erweiw/qwen3-0.6b PY=/shared/erweiw/venv/bin/python \
 # numpy 在 /shared/erweiw/venv(lit 也在那儿)
 ```
 
+### 2.9 一个 step 带几个 token 是运行时量 —— 真权重下的多步解码(commit `6b599605`)
+
+在这之前每个 step 都固定带 `tokens` 行,所以整条链其实是 **prefill**:
+真正的 decoder 先吃完 prompt,然后一次走一个 token。现在 step 的 token 数是运行时量。
+
+**Fleet 的形状**(这次把它读准了):`prepare_next_batch` 在设备上算
+`prompt_length - step`(prefill,按每请求上限截断)或 `1`(decode)
+(`persistent_kernel.cuh:441-450`),写进 `qo_indptr_buffer`;task 再从里面
+**读出自己的 trip count**(`multitoken_paged_attention_mfma_mi300.cuh:78-83`)。
+**task graph 自始至终不变。** 所以这里:prompt 长度以 buffer 而不是折叠常量进设备,
+step 循环用 `iter_args` 带着序列长度,窗口基址和 attention 长度都按 step 自己的数量走。
+
+两个直接后果:
+
+1. **token buffer 从 `[step][row]` 变成一条扁平的流。** 一个 step 的各行是**同一个序列**
+   里的相邻位置 —— step 内部的 attention 就是窗口因果的,第 m 行本来就读第 m-1 行写进去的
+   东西 —— 而一个序列只有**一个**下一 token,不是 `tokens` 个。它是**最后一个活跃行**的
+   argmax,而且只在那个槽位已经越过 prompt 时才写回,对应
+   `persistent_kernel.cuh:396` 的那个 guard。
+   > 旧写法(每行各自产出下一 token)是错的,而且**对文件里所有检查都是隐形的** ——
+   > host 参考和设备一起那么做。又一次第六类假绿。
+2. **prompt 比窗口长就分几个 step 吃完**(Fleet 的 chunked prefill,
+   `MPK_MAX_TOKENS_PER_REQUEST`)。5 个 token 的 prompt 配窗口 2,五个 step 依次带
+   **2, 2, 1, 1, 1** 个 token,全在**同一张静态 task graph** 上;中间那个 1 是 prompt
+   的零头,所以是三种不同的数量,不只是"先 prefill 再 decode"。
+
+**只改设备侧的七个证伪**(2 层 / 5 step / 窗口 2,hidden / logits / tokens):
+
+| 改坏什么 | hidden | logits | tokens |
+|---|---|---|---|
+| prompt 用完后窗口不收缩 | 256 | 485 | 4 |
+| 序列按窗口推进而不是按本步 token 数 | 128 | 249 | 2 |
+| attention 长度不随本步 token 数增长 | 127 | 199 | 0 |
+| 去掉写回 guard(生成的 token 盖掉 prompt 槽位) | 142 | 226 | 0 |
+| step 从流的 0 处读而不是从上次停的地方 | 254 | 495 | 3 |
+| 下一 token 取 chunk 的第一行而不是最后一行 | 109 | 231 | 1 |
+| **padding 行照算不跳过** | **0** | **0** | **0** |
+
+**最后一条不是漏网。** 活跃数之外的行是惰性的:两个单任务 stage(0 和 5)的循环上界
+就是活跃数,所以那些行根本没被重新归一化;它们会写的 cache 槽位又在任何 step 的
+attention 长度之外,下一步就被真值覆盖。**Fleet 也照算这些行**
+(`linear_ck_mi300.cuh` 把 `num_active_tokens` 一路传进去却**根本没用**,
+只有 attention 真按它走)。这里跳过它们,是为了让 host 参考也能跳过。
+
+中间两条 **hidden/logits 红而 tokens 不红**,还是 §2.7 那个结论:
+argmax 太钝,logits 比对才是真正在管词表尾部的那一关。
+
+**真权重,28 层,一次 launch 六个 step:**
+
+| | |
+|---|---|
+| prompt | `785,6722,315,9625,374` = `"The capital of France is"` |
+| 链 | `12095,13,576,6722,315,15344` |
+| numpy | `12095,13,576,6722,315,15344` |
+| 文本 | `" Paris. The capital of Italy"` |
+
+`qwen3_ref.py` 现在**完全没有 KV cache** —— 每一步把整个前缀重算一遍。
+这是故意的:cache 正是被测的东西之一,参考就不能跟它共用。
+
+```bash
+QWEN_DIR=/shared/erweiw/qwen3-0.6b PY=/shared/erweiw/venv/bin/python \
+  STEPS=6 test/gpu/megakernel_gen/run_qwen.sh          # 整个 prompt 一步 prefill
+QWEN_DIR=... STEPS=5 WIN=2 test/gpu/megakernel_gen/run_qwen.sh   # 分块 prefill
+```
+
+`run_all.sh` 里加了 `megakernel_gen_chunked`(`STEPS=5 TOKENS=2 PROMPT_LEN=5`),
+**18 个测试全过**。`PROMPT_LEN` 不给就是"整段都是 prompt",退化成改动前的形状,
+所以原来那两个 gen 测试是精确的回归基线。
+
 ---
 
 ## 3. 方法论 —— 这条别丢
@@ -375,6 +452,23 @@ rope 位置都改了、模型只改 q;sed 共享 query、模型共享输出),不
 另外**证伪脚本自己要有守卫** —— sed 没匹配上要报 `SED DID NOT MATCH`,
 我写出过恒等替换,靠这个守卫才没把"改了个寂寞"当成一次证伪。
 
+**第七次:md5 守卫挡不住"两边一起改"。** sed 守卫只问"文件变了没有"。
+但 host 参考和设备代码在同一个文件里,有几行**逐字相同** ——
+`%curlen = arith.addi %wbase, %nat : index` 两边各一份。sed 把两份都改了,
+两边一起错,比对报 0,而 md5 显示文件**确实变了**,守卫一声不吭。
+我头一版 §2.9 的证伪矩阵里有两条就是这样,数字全是假的。
+
+**修法:把 sed 按行号限定在设备那一半**(`func.func @chain` 之后),
+**并且断言命中的站点数**。顺带把"这段文字在 host 侧也出现了几次"打出来 ——
+命中数对上了,才敢说这次证伪是设备侧的。
+
+```bash
+start=$(grep -n 'func.func @chain' v.mlir | cut -d: -f1)
+n=$(awk -v s=$start -v p="$pat" 'NR>=s && index($0,p)' v.mlir | wc -l)
+[ "$n" = "$want" ] || { echo "PATTERN HIT $n SITES, EXPECTED $want -- proved nothing"; }
+sed -i "${start},\$ s|$pat|$rep|" v.mlir
+```
+
 **第四次(M>1 时抓到的,最隐蔽):参考值比对本身可以是虚的。**
 生成器的容差是**相对**的(分母 `max(|want|,1)`)。残差流炸到 1e4 之后,
 绝对误差几百都在容差内 —— 比对还在跑、还在报 0,但它什么都拦不住。
@@ -406,11 +500,11 @@ attention 输出与 query 无关。改成 `f(t²+3i)` 才有内容。
 
 **机制层面到头了**:M>1(§2.5)、Qwen layer 形状、GQA 多头 + RoPE + qk-norm +
 KV 写回 + 窗口因果(§2.3)、**一次 launch 跑完多步解码 + cache 增长 + 迭代版本化**
-(§2.6)都接完并真机验证。剩下的按优先级:
+(§2.6)、**每步 token 数是运行时量 → 真权重下的真解码**(§2.9)
+都接完并真机验证。剩下的按优先级:
 
-1. **真权重下的多步解码**。现在真权重只跑 prefill(一步走完 prompt)。
-   多步要让窗口在第一步之后缩成 1 个 token —— `tokens` 目前是每步固定的。
-   **这是"真的在解码"缺的最后一块。**
+1. ~~真权重下的多步解码~~ —— **做完了,见 §2.9**。窗口现在按运行时的活跃 token 数
+   收缩,prompt 比窗口长还会分块 prefill。
 2. **tokenizer**。现在 prompt 和输出都是 token id,要靠 `vocab.json` 手工查。
    BPE 编码没做。
 3. **张量并行 / allreduce**(Fleet 的 `allreduce_layer`)。单卡下没意义,

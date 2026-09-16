@@ -22,7 +22,7 @@ The cluster has MI350: partition `mi350x-es`, nodes
 |---|---|---|
 | Fleet torch baseline, MI300X | Qwen3-0.6B decode | **26.57 ms/token** |
 | AIR chain (this repo), MI300X | Qwen3-0.6B, 5-token prefill | **8.34 s** = 1.67 s/token |
-| Fleet MPK megakernel | — | **in progress on MI350**, job 71763 |
+| Fleet MPK megakernel | — | **builds on MI350**; run blocked on a loader clash, job 71826 |
 
 **The first two are not the same quantity and must not be tabled side by side
 without this sentence.** 26.57 ms is per decoded token; 1.67 s is per prefilled
@@ -141,8 +141,44 @@ the documented platform is MI350 anyway.
   so they are visible from both clusters.
 - There is no `tasks/mi350/`; gfx950 compiles the same `tasks/mi300/*.cuh`.
   CK's `#if defined(__gfx950__)` selects different implementations inside, so
-  whether the CK mismatch above still bites on gfx950 is **an open question** --
-  that is exactly what job 71763 answers.
+  whether the CK mismatch above still bites on gfx950 was an open question.
+
+**Answered: it does not. Fleet builds clean on gfx950.** Job 71763,
+`pip install -e . --no-build-isolation`, 04:58:37 -> 05:39:22, **rc=0**, 41
+minutes, and `import mirage` works. Node reports
+`gfx950:sramecc+:xnack-`. So every CK failure in the section above was a
+consequence of building for the wrong architecture, not a missing dependency
+revision -- the version table stays useful as a record of what each tag does,
+but it was never the blocker.
+
+Two notes on that build, since "it looked stuck" twice:
+
+- The long phase is **`Preparing editable metadata`**, 04:58 to 05:16, which is
+  where cmake configures. Then the Cython `core.o` links against a 101 MB
+  `libmirage_runtime.a`.
+- **The object files go to node-local `/tmp`** (`/tmp/tmp*.build-temp/`), not
+  into `/shared/erweiw/fleet/build`. Watching the shared tree for new `.o`
+  shows nothing happening when plenty is. The 92 `.o` sitting in
+  `build/CMakeFiles` are leftovers from the earlier killed attempt.
+
+**The run then failed, and not for a Fleet reason:**
+
+```
+ImportError: /opt/rocm-7.2.3/lib/libamdhip64.so.7: undefined symbol:
+             hsa_amd_memory_get_preferred_copy_engine, version ROCR_1
+```
+
+`import mirage` on its own is fine. `demo.py` imports `models.modeling_qwen3`
+first, which pulls in torch, which brings its own ROCm 6.4
+`libhsa-runtime64.so.1`; mirage's extension then loads ROCm 7.2's
+`libamdhip64.so.7`, which wants a symbol 6.4 does not export. It is the same
+clash as on MI300X and the same fix -- `LD_PRELOAD=/opt/rocm/lib/libhsa-runtime64.so.1`
+-- which job 71826 (`/shared/erweiw/fleet_mi350b.sbatch`) applies. That script
+skips the build (the editable install persists) and runs the torch baseline
+plus all three README modes.
+
+**Neither of the two local patches was needed for the architecture.** They were
+needed to build the package at all, on either platform.
 
 **A mistake worth not repeating**: the first MI350 build looked like it was
 running for 25 minutes and was not. It had been launched under `srun` in a
