@@ -21,15 +21,55 @@ The cluster has MI350: partition `mi350x-es`, nodes
 | | | |
 |---|---|---|
 | Fleet torch baseline, MI300X | Qwen3-0.6B decode | **26.57 ms/token** |
-| AIR chain (this repo), MI300X | Qwen3-0.6B, 5-token prefill | **8.34 s** = 1.67 s/token |
-| Fleet MPK megakernel | — | **builds on MI350**; run blocked on a loader clash, job 71826 |
+| AIR chain (this repo), MI300X | Qwen3-0.6B decode | **~6.4 s/token** |
+| Fleet MPK megakernel | — | **builds on MI350**; run blocked on node faults |
 
-**The first two are not the same quantity and must not be tabled side by side
-without this sentence.** 26.57 ms is per decoded token; 1.67 s is per prefilled
-token. Per token the linear layers do the same work, so "the AIR chain is ~60x
-slower than the HF torch baseline" is a fair order of magnitude, but it is not
-a like-for-like measurement. To compare properly the AIR side has to decode,
-which needs the window to shrink to one token after the first step (NEXT.md §4).
+**These first two are now the same quantity.** The AIR chain decodes (NEXT.md
+§2.9), so this is per decoded token on both sides, same GPU, same model, same
+weights: **the AIR chain is about 240x slower than the HF torch baseline.**
+Why is already recorded in NEXT.md §5 -- one thread per workgroup -- and is not
+this work's priority.
+
+Measured by the slope over `REPEAT`, which isolates the device from the
+one-off cost of reading three gigabytes off NFS and running the host
+reference. Every slope below came from 2-3 points and each was re-run and
+reproduced to within 1%:
+
+| prompt | window | steps | device s/launch |
+|--:|--:|--:|--:|
+| 5 | 5 | 1 | 8.37 |
+| 10 | 10 | 1 | 16.20 |
+| 5 | 5 | 2 | 36.88 |
+| 10 | 5 | 2 | 60.87 |
+| 5 | 5 | 6 | 62.36 |
+
+**Two readings, one of them unexplained.**
+
+1. *Within one step the cost is exactly linear in tokens*: 5 -> 10 tokens takes
+   8.37 -> 16.20 s, a factor of 1.94. About **1.6 s per token position**.
+2. *Splitting the same work across steps costs 3.8x*: ten token positions cost
+   **16.20 s in one step and 60.87 s in two**. Identical arithmetic, identical
+   weights, 3.8x apart. Rows 3, 4 and 5 are all within a few percent of 3.8x
+   their single-step equivalents, so it is a one-time penalty for `steps > 1`
+   rather than a per-step cost.
+
+**I do not know what causes (2), and did not guess in public.** Two hypotheses
+were tested and both failed: the kernel is not being specialised for the
+single-trip step loop (the gpu.module is 3493 vs 3494 lines for steps 1 and 2),
+and no device loop is bounded by anything that grows with `steps`. A
+per-stage-barrier model does not fit either -- it would need ~174 ms per
+barrier to explain row 4, and rows 1 and 2 bound the barrier cost at ~2 ms.
+
+Settling it needs in-kernel timing, which is **currently broken**: `mgpuEventRecord`
+records on a stream `gpu-to-llvm` does not launch the kernel on, so
+`mgpuEventElapsedTime` returns `hipErrorInvalidHandle` (NEXT.md §5;
+`test/gpu/4k_4k_mul` has been printing this error all along). Fleet solves the
+same problem with `s_memrealtime` accumulators behind `MPK_DEVICE_TIMING`,
+which is the cheaper thing to copy.
+
+**The number to quote is the multi-step one.** The 8.34 s/launch in the earlier
+version of this file was the `steps = 1` row, and at 1.67 s/token it is
+optimistic by that same 3.8x for anything that actually decodes.
 
 Why the AIR chain is slow is already recorded in NEXT.md §5: **one thread per
 workgroup**, so 32 workgroups x 1 thread = 32 threads. 5.97 GFLOP in 8.34 s is
@@ -176,6 +216,29 @@ clash as on MI300X and the same fix -- `LD_PRELOAD=/opt/rocm/lib/libhsa-runtime6
 -- which job 71826 (`/shared/erweiw/fleet_mi350b.sbatch`) applies. That script
 skips the build (the editable install persists) and runs the torch baseline
 plus all three README modes.
+
+**With LD_PRELOAD the import succeeds and the next failure is the hardware:**
+
+```
+RuntimeError: No HIP GPUs are available
+```
+
+Not a torch-vs-gfx950 problem -- `strings libtorch_hip.so` lists **gfx950**, and
+the wheel is 2.9.1+rocm6.4. It is the node. Minutes later:
+
+```
+$ sinfo -p mi350x-es -o "%n %T %E"
+smci350-rck-g03-f13-21  inval   gres/gpu count reported lower than configured (0 < 8)
+smci350-rck-g03-d13-21  mixed-                     # trailing '-' = draining
+```
+
+Both MI350 nodes in this cluster are unhealthy: one reports zero of its eight
+GPUs, and the one that did the build is draining. **So the Fleet MPK number is
+blocked on hardware availability, not on anything in Fleet or in the
+toolchain.** `/shared/erweiw/probe350.sbatch` (job 71830) is queued and will
+run the moment a node comes back -- it tries torch with and without the
+preload, and torch-then-mirage both ways, so it settles which combination
+works in one shot before spending 40 minutes on a demo.
 
 **Neither of the two local patches was needed for the architecture.** They were
 needed to build the package at all, on either platform.
