@@ -469,17 +469,18 @@ the lane-to-slot mapping the intermediate step assumes, not the shuffle and not
 LDS. Worth roughly 20-30%, and the combine is the largest single item in the
 body, so it is worth going back to with fresh eyes.
 
-### Can air-on-gpu target CK? Yes for the mechanism; see `workspace/ck/`
+### Can air-on-gpu target CK? Yes -- mechanism and numerics both
 
 Since the ablation says the gap is the task body and Fleet's bodies are CK, the
-obvious question is whether AIR can call CK rather than reimplement it. Three
-probes, all run on gfx942, in `workspace/ck/` with a `run.sh`:
+question is whether AIR can call CK rather than reimplement it. Four probes,
+gfx942, in `workspace/ck/` with a `run.sh` that reproduces them:
 
 | probe | establishes | result |
 |---|---|---|
 | `probe.hip` | an MLIR-generated kernel can call a hipcc `__device__` function | `[17,19,21,23]`, exact |
 | `lds_probe.hip` | the callee can own `__shared__` and `__syncthreads()` | array reversed, exact |
-| `ck_gemm.hip` | `ck_tile` compiles into such a callee and executes | runs; numerics wrong |
+| `ck_gemm.hip`, M=128 | a `ck_tile` GEMM compiles into one and is correct | all 4096 elements == 128 |
+| `ck_m1.mlir`, **M=1** | ... including at the shape a decode step has | all 32 elements == 128 |
 
 The hook is `rocdl-attach-target{... l=<file>.bc}` -- the ROCDL target attribute
 carries bitcode libraries that `gpu-module-to-binary` links before codegen, so
@@ -496,15 +497,33 @@ Those are the four counters the original ISA diff recorded as **0** for AIR,
 and no MFMA was written in MLIR to get them. (gfx942 picks the 16x16x16 bf16
 MFMA; gfx950 has the 16x16x32 that Fleet's assembly uses.)
 
-**What does not work yet, and why it is the interesting part.** The GEMM
-computes wrong numbers, and the reason is not the linking: **CK's upstream
-policies cannot distribute a small-M tile.** At `MPerBlock=16, KPerBlock=64`,
-`GemmPipelineAGmemBGmemCRegV2DefaultPolicy` fails a static assertion --
-`M0 * M1 * M2 == MPerBlock`, "must cover whole MPerBlock". Upstream CK is tuned
-for training-shaped GEMMs; a decode step is M=1. That is exactly why Fleet
-ships `GemmPipelineSmallTilePolicy` (`linear_ck_mi300.cuh:134`) and passes it
-explicitly everywhere it calls a pipeline. So "target CK" means "target CK plus
-a small-M policy", and Fleet's is Apache-2.0 and already in `deps/`.
+All of it with **CK's stock pipeline and default policy** --
+`GemmPipelineAGmemBGmemCRegV1` at CK's own reference tile, `M_Tile 128,
+N_Tile 32, K_Tile 128/sizeof(bf16)`, `4x1x1` warps, `32x32x8` warp tile
+(`example/ck_tile/03_gemm/gemm_utils.hpp:42-52`).
+
+**A wrong claim this section used to make.** It said CK's upstream policies
+"cannot distribute a small-M tile", so targeting CK meant targeting CK plus a
+small-M policy. False, and reached from a single failure generalised without a
+second data point -- the same way four of the six performance theories in this
+file went wrong.
+
+The probe had started from Fleet's tile config (`MPerBlock=16, NPerBlock=64,
+KPerBlock=256`), which belongs to Fleet's *own* `GemmPipelineSmallTilePolicy`;
+paired with the stock policy it gave wrong numbers, and perturbing it to
+`KPerBlock=64` while debugging tripped a static assertion that got read as
+"small M unsupported". The wrong numbers had two causes, both mine: the
+mismatched tile/policy pair, and a harness bug where one MLIR constant served
+as both the K bound and the block size, so the launch had 128 threads where
+`BlockWarps<4,1,1>` needs 256.
+
+Nothing in AIR asks for a 16-row tile. M is 1 at a decode step -- that is what
+decoding one token is, and it is equally true of Fleet -- but the *tile* M is a
+free blocking parameter, and a 128-row tile is correct at M=1 because the
+tensor view carries the real `m_size`. Fleet's small-tile policy buys
+**efficiency, not capability**: at M=1 a `32x32` warp tile wastes 31 of 32
+output rows against Fleet's 15 of 16. Which tile to use for decode is a tuning
+question to measure, not a precondition to clear.
 
 Four things that bite, in the order they bit:
 
@@ -518,12 +537,12 @@ Four things that bite, in the order they bit:
 3. **CK wants dynamic LDS** (`extern __shared__`, sized at launch). `air.launch`
    sets no dynamic shared memory operand; a wrapper with a fixed-size
    `__shared__` sidesteps it and is proven to work from a linked callee.
-4. **The workgroup size is part of the CK type.** `BlockWarps = sequence<1,4>`
-   is 256 threads; the megakernel runs 512 at `--waves 8`. They must agree.
+4. **The workgroup size is part of the CK type.** `BlockWarps<4,1,1>` is 256
+   threads; get it wrong and the kernel returns zeros with no diagnostic.
 
-Integration would also need the weights transposed to `[out][in]` -- CK names B
+Integration still needs the weights transposed to `[out][in]` -- CK names B
 `ColumnMajor` and this repo stores `[k][n]` -- which is the same transpose
-already wanted for vector loads, and the f32 workspace plus finalize stage that
+already wanted for vector loads, plus the f32 workspace and finalize stage that
 the cross-workgroup K-split needs anyway.
 
 ### What is left, in the order the measurements rank it

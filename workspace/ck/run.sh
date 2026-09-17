@@ -27,6 +27,9 @@ echo "=== 1. calling a hipcc device function from an MLIR kernel (expect 17 19 2
 build "$D/probe.hip" "$D/probe.bc";         run "$D/call.mlir"     "$D/probe.bc" | tail -1
 echo "=== 2. __shared__ and __syncthreads() in the callee (expect 63 62 61 ...)"
 build "$D/lds_probe.hip" "$D/lds_probe.bc"; run "$D/lds_call.mlir" "$D/lds_probe.bc" | tail -1 | cut -c1-90
-echo "=== 3. a ck_tile GEMM pipeline (runs; numerics still wrong, see README)"
-build "$D/ck_gemm.hip" "$D/ck_gemm.bc";     run "$D/ck_call.mlir"  "$D/ck_gemm.bc" | tail -1 | cut -c1-90
+build "$D/ck_gemm.hip" "$D/ck_gemm.bc"
+echo "=== 3. a ck_tile GEMM, M=128 (expect all 4096 elements == 128)"
+run "$D/ck_call.mlir" "$D/ck_gemm.bc" | python3 "$D/check.py" 128 4096
+echo "=== 4. the same GEMM at M=1, which is what a decode step is (expect 32 x 128)"
+run "$D/ck_m1.mlir"   "$D/ck_gemm.bc" | python3 "$D/check.py" 128 32
 rm -f "$D"/t3.mlir "$D"/t4.mlir
