@@ -146,6 +146,92 @@ One honest non-match: AIR emits 74 `global_load_dword ... nt`; Fleet emits
 `gang_ksplit`/`gang_moe` paths, not compiled here). So AIR's `nt` use cannot
 be said to agree with Fleet's -- there is nothing to compare against here.
 
+## The GEMM artifact diff, loop for loop (2026-09-17)
+
+Round one compared whole-file instruction counts, which mixes five stages
+together. This compares the **GEMM inner loops themselves**. Tools:
+`workspace/scratch/{gemmloops,mlp2,loops}.awk`. No GPU needed.
+
+**First, is the comparison even valid?** Fleet's `persistent_kernel` has 353
+inner loops. Exactly two are heavy, and they are the same loop emitted twice:
+`.LBB5_1185` (line 17402) and its twin at 25035 -- 319 lines, 40 loads, 104
+LDS ops, 32 MFMA. Every other loop is under 72 lines. The 48 `v_fmac_f32` in
+the whole kernel occur in scattered *pairs* (elementwise, not a GEMM) and the
+1174 `global_load_dwordx2` never cluster. **So there is no scalar GEMM path:
+at batch 1 Fleet's linear layers go through the MFMA loop.**
+
+| per GEMM inner-loop iteration | Fleet | AIR head | AIR trc |
+|---|--:|--:|--:|
+| instructions | 317 | 14 | 119 |
+| math | 32x `v_mfma_f32_16x16x32_bf16` | 1 mul + 1 add | 16 mul + 16 add |
+| raw MACs per wave | 262 144 | 64 | 1 024 |
+| **useful MACs at M=1** | **16 384** | **64** | **1 024** |
+| loads | 40 `buffer_load_dwordx4` | 1 ushort + 1 dword | 16 + 16 |
+| bytes per load per lane | 16 | 2 / 4 | 2 / 4 |
+| **max loads outstanding** | **20** | **2** | **32** |
+| **bytes in flight per wave** | **20 480** | **384** | **6 144** |
+| LDS ops / barriers | 104 / 8 | 0 / 0 | 0 / 0 |
+| 64-bit address ops per MAC | **0** | 6 | 0.44 |
+| instructions per useful MAC | 0.0193 | 0.219 (**11.3x**) | 0.116 (**6.0x**) |
+
+Taken on the same target: `fleet.s` is gfx950 and AIR was recompiled to gfx950
+(`runs/head.950.s`, `runs/trc.950.s`) to rule out an ISA-version artifact. The
+numbers are identical to the gfx942 build, because AIR emits no MFMA either
+way.
+
+### The three differences, ranked by what they are worth
+
+**1. Memory in flight -- 53x, and it is the whole story.** Neither kernel is
+issue-bound (Fleet is at ~0.1% of the matrix core, AIR at 0.04% of the vector
+units) and neither is bandwidth-bound (5.6% and 1.1% of HBM). Both are
+latency-bound, and for a latency-bound kernel Little's law says throughput is
+just bytes-in-flight over latency. Fleet's loop waits on `vmcnt(15)`,
+`vmcnt(8)`, `vmcnt(7)` -- it deliberately keeps 7 to 15 loads outstanding, which
+is software pipelining. AIR's issues two loads and waits for both. **20 480
+bytes in flight against 384.**
+
+That also says the measured 7.5x end-to-end gap is *smaller* than the artifact
+difference, which is what you would expect when caches absorb part of it.
+
+**2. Load width -- 8x.** Fleet reads through a buffer resource descriptor,
+`buffer_load_dwordx4`, 16 bytes a lane. AIR emits **zero `buffer_load`** in any
+variant: flat/global loads of `ushort`, 2 bytes a lane. Same traffic, eight
+times the instructions, and eight times fewer bytes per unit of latency.
+
+**3. Addressing -- 32-bit versus 64-bit.** Fleet's loop has *no* 64-bit
+arithmetic: 25 `v_add_u32` and 8 `v_lshl_add_u32`, because a buffer descriptor
+takes a 32-bit voffset. AIR spends six 64-bit ops per MAC (three
+`v_lshl_add_u64`, one `v_cmp_lt_u64`, two 64-bit scalar ops) because MLIR
+`index` lowers to i64 and the trip count is unprovable. This is the one the
+counted loop already fixes: 6 per MAC down to 0.44.
+
+### And the honest observation about Fleet
+
+**At M=1 Fleet wastes 15/16 of its matrix core.**
+`v_mfma_f32_16x16x32_bf16` computes a 16-row output tile; at batch 1 one row is
+real. So the headline 827 MACs per instruction is **51.7 useful** MACs per
+instruction. The 104 LDS ops and 8 barriers per iteration stage tiles for an A
+reuse that does not exist at M=1 either. Fleet's batch-1 GEMM looks like a
+prefill kernel being run at batch 1 -- which agrees with the separate finding
+below that MFMA at M=1 is *worse* per useful MAC than a scalar FMA.
+
+Two consequences. The bar is not the 180x that raw MACs-per-instruction
+suggests: on useful work it is **11.3x**, and `trc` already takes it to 6.0x.
+And copying Fleet's kernel exactly is not the target -- the target is its
+memory pipelining, not its matrix core.
+
+### What to do, in order
+
+1. **Vector loads.** `vector<8xbf16>` on the weights takes bytes-per-load from
+   2 to 16 a lane and closes the residual 3.3x in bytes-in-flight. Needs the
+   `[out][in]` layout, which is why that change comes first.
+2. **Ship the counted loop** if it measures, for the 6-per-MAC to 0.44 of
+   64-bit addressing and the 2-to-32 loads outstanding.
+3. **`buffer_load` instead of flat.** Needs a buffer descriptor in the
+   lowering; worth it for the 32-bit addressing alone.
+4. **MFMA last, and only with a K-split or multi-token M.** At M=1 it is a
+   regression.
+
 ## Closing the gap: 10 430 -> 153 ms/token, 2026-09-16
 
 Step 1 of the ranked fix above landed; steps 2 and 3 did not, and the reason
