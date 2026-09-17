@@ -545,6 +545,91 @@ Integration still needs the weights transposed to `[out][in]` -- CK names B
 already wanted for vector loads, plus the f32 workspace and finalize stage that
 the cross-workgroup K-split needs anyway.
 
+### Would enabling CK close the gap? No. It is worth about 1.3x.
+
+Measured, not argued. Same ablation method as round four: a build per stage
+class with that class's *body* emptied (claims, counts, barriers all still
+run), everything at `LO=1 HI=100`.
+
+First, two confounds removed:
+
+| | ms/token |
+|---|--:|
+| AIR on **MI350X** (gfx950), the GPU Fleet was measured on, same config | 25.5 |
+| AIR on MI300X, same config | 23.9 |
+
+MI350X is **1.07x slower**, not faster. The platform is not the gap -- and the
+old "AIR is 4.5x slower on MI350X" note in this file was a contended-node
+artifact, now superseded. And on token accounting: the headline AIR number
+averages one 5-token prefill step with five decode steps. Pure decode, every
+step one token, is **21.0 ms/token**. So like for like, pure decode on MI350X,
+AIR is ~22.4 against Fleet's 2.43: **9.2x**.
+
+Where those 24 ms go (MI300X control 24.0):
+
+| stage class | ms | % | does CK replace it? |
+|---|--:|--:|---|
+| the four matmuls per layer | 7.2 | 30% | **yes** |
+| attention | 4.3 | 18% | a different CK kernel (FMHA) |
+| lm head + argmax | 3.3 | 14% | the GEMM part |
+| rmsnorm x2 per layer + final | 1.9 | 8% | no |
+| rope + KV append | 0.9 | 4% | no |
+| SwiGLU | 0.7 | 3% | no |
+| the whole event protocol, 1512 barriers | 1.1 | 5% | no |
+| unattributed (claim loops, per-stage fixed cost) | 4.6 | 19% | no |
+
+So **CK addresses 30% of the time.** Even making the matmuls cost *zero*:
+
+```
+CK on the matmuls           -> 16.8 ms/token   1.43x   still 6.9x off Fleet
+CK on matmuls + attn + lm   ->  9.2 ms/token   2.61x   still 3.8x off Fleet
+```
+
+Realistically CK makes the matmuls 3-5x faster rather than free, so the honest
+expectation for CK-on-the-matmuls is **24 -> ~18 ms/token, about 1.3x**.
+
+### And MFMA is the wrong instruction for a decode step
+
+`v_mfma_f32_16x16x16_bf16` computes `C[16][16] += A[16][16] x B[16][16]` --
+4096 MACs per wave instruction, ~8 cycles on CDNA3. At M=1 only one row of A is
+real, so 16x16 = 256 of those MACs are useful: **32 useful MACs/cycle**. A
+`v_fmac_f32` across 64 lanes is 64 MACs in one cycle: **64 useful MACs/cycle**.
+
+At M=1 the matrix core is about **2x worse per cycle than scalar FMA**. It pays
+from M=16 up -- prefill, speculative decode, batching -- not at batch-1 decode.
+What CK still buys there is the *load* side: `buffer_load_dwordx4` moves 1024 B
+per wave instruction against the 128 B of a `global_load_ushort`, an 8x cut in
+memory instructions, plus software pipelining and no hand-rolled cross-lane
+combine. That is real, and it is 30% of the time.
+
+### What the breakdown actually points at
+
+The stages CK does not touch are exactly the ones running on almost none of the
+machine:
+
+| stage | pieces | threads/wg | threads busy | of machine | ms |
+|---|--:|--:|--:|--:|--:|
+| matmuls, SwiGLU, lm head | 128 | 512 | 65536 | 100% | |
+| attention | 16 | 64 | 1024 | **1.6%** | 4.3 |
+| rope + KV append | 16 | 64 | 1024 | **1.6%** | 0.9 |
+| rmsnorm | **1** | 64 | 64 | **0.1%** | 1.9 |
+
+`rmsnorm` is a `single_stage`: **one workgroup of 128 does the whole row while
+the other 127 wait at the barrier**, 336 times a launch. Attention is one piece
+per head, 16 of them, and wave 0 only. Those are decomposition mistakes in this
+reproduction, not kernel-quality problems, and no amount of CK fixes them.
+
+Ranked by measured cost, and CK is third:
+
+1. **Attention, 4.3 ms at 1.6% occupancy.** Split over key positions as well as
+   heads -- Fleet's split-KV -- and let all eight waves work.
+2. **rmsnorm, 1.9 ms at 0.1% occupancy.** It is one task because a row
+   reduction cannot be split by output slice; it can be split by *input* slice
+   into partials plus a reduce, or fused into the producer as Fleet does.
+3. **CK for the matmuls and the lm head, ~1.3x.** Necessary eventually,
+   and it forces the `[out][in]` transpose and the K-split anyway, but it is
+   not the first thing to do and it is not sufficient.
+
 ### What is left, in the order the measurements rank it
 
 1. **Cross-workgroup K-split** -- Fleet's `gang_ksplit_linear_mi300.cuh`:
