@@ -469,6 +469,63 @@ the lane-to-slot mapping the intermediate step assumes, not the shuffle and not
 LDS. Worth roughly 20-30%, and the combine is the largest single item in the
 body, so it is worth going back to with fresh eyes.
 
+### Can air-on-gpu target CK? Yes for the mechanism; see `workspace/ck/`
+
+Since the ablation says the gap is the task body and Fleet's bodies are CK, the
+obvious question is whether AIR can call CK rather than reimplement it. Three
+probes, all run on gfx942, in `workspace/ck/` with a `run.sh`:
+
+| probe | establishes | result |
+|---|---|---|
+| `probe.hip` | an MLIR-generated kernel can call a hipcc `__device__` function | `[17,19,21,23]`, exact |
+| `lds_probe.hip` | the callee can own `__shared__` and `__syncthreads()` | array reversed, exact |
+| `ck_gemm.hip` | `ck_tile` compiles into such a callee and executes | runs; numerics wrong |
+
+The hook is `rocdl-attach-target{... l=<file>.bc}` -- the ROCDL target attribute
+carries bitcode libraries that `gpu-module-to-binary` links before codegen, so
+CK is inlined with the MLIR kernel rather than called across a boundary.
+
+**What CK brings into the linked kernel**, counted in its assembly:
+
+```
+v_mfma_f32_16x16x16_bf16   96      ds_write    60
+ds_read                    96      s_barrier   12
+```
+
+Those are the four counters the original ISA diff recorded as **0** for AIR,
+and no MFMA was written in MLIR to get them. (gfx942 picks the 16x16x16 bf16
+MFMA; gfx950 has the 16x16x32 that Fleet's assembly uses.)
+
+**What does not work yet, and why it is the interesting part.** The GEMM
+computes wrong numbers, and the reason is not the linking: **CK's upstream
+policies cannot distribute a small-M tile.** At `MPerBlock=16, KPerBlock=64`,
+`GemmPipelineAGmemBGmemCRegV2DefaultPolicy` fails a static assertion --
+`M0 * M1 * M2 == MPerBlock`, "must cover whole MPerBlock". Upstream CK is tuned
+for training-shaped GEMMs; a decode step is M=1. That is exactly why Fleet
+ships `GemmPipelineSmallTilePolicy` (`linear_ck_mi300.cuh:134`) and passes it
+explicitly everywhere it calls a pipeline. So "target CK" means "target CK plus
+a small-M policy", and Fleet's is Apache-2.0 and already in `deps/`.
+
+Four things that bite, in the order they bit:
+
+1. **`func.func private` is the wrong declaration.** It gets an
+   `emit_c_interface` wrapper, so MLIR emits a *definition* of the symbol that
+   calls `_mlir_ciface_<name>`, which nothing defines -- and that definition
+   shadows the one the bitcode provides. The module then fails to load and the
+   kernel silently writes zeros. Use `llvm.func` and `llvm.call`.
+2. **`-fgpu-rdc` plus `__attribute__((used))`**, or a `__device__` function with
+   no caller in its translation unit is deleted before it reaches the bitcode.
+3. **CK wants dynamic LDS** (`extern __shared__`, sized at launch). `air.launch`
+   sets no dynamic shared memory operand; a wrapper with a fixed-size
+   `__shared__` sidesteps it and is proven to work from a linked callee.
+4. **The workgroup size is part of the CK type.** `BlockWarps = sequence<1,4>`
+   is 256 threads; the megakernel runs 512 at `--waves 8`. They must agree.
+
+Integration would also need the weights transposed to `[out][in]` -- CK names B
+`ColumnMajor` and this repo stores `[k][n]` -- which is the same transpose
+already wanted for vector loads, and the f32 workspace plus finalize stage that
+the cross-workgroup K-split needs anyway.
+
 ### What is left, in the order the measurements rank it
 
 1. **Cross-workgroup K-split** -- Fleet's `gang_ksplit_linear_mi300.cuh`:
