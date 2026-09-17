@@ -25,6 +25,17 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LABEL="${1:-run}"
+
+# Refuse to start if another run of this script is already on the node. Two
+# runs sharing one GPU produce numbers that look fine and mean nothing, and
+# that is exactly what happened when a relaunch raced a copy that had not
+# actually died.
+LOCK=/tmp/air_bench.lock
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "another bench.sh holds $LOCK on $(hostname) -- refusing to share the GPU" >&2
+  exit 1
+fi
 ALTGEN="${2:-}"
 export QWEN_DIR="${QWEN_DIR:-/shared/erweiw/qwen3-0.6b}"
 export PY="${PY:-/shared/erweiw/venv/bin/python}"

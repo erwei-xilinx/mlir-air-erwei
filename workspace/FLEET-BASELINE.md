@@ -33,10 +33,10 @@ latency, comparable with the torch row.
 | Fleet `fleet` M-tile | MI350X | bf16 | 2.591 | 4.0x faster |
 | torch / HF eager | MI350X | bf16 | **10.48** | 1x |
 | AIR, before this work | MI300X | f32 | 10 430 | 1 000x slower |
-| AIR, **now** | MI300X | f32 | **153.0** | 15x slower |
+| AIR, **now** | MI300X | f32 | **66** | 6x slower |
 | AIR (as measured earlier) | MI350X | f32 | 28 700 | 2 740x slower |
 
-The AIR row moved by **68x** on 2026-09-16; see "Closing the gap" below for
+The AIR row moved by **158x** on 2026-09-16/17; see "Closing the gap" below for
 what did it and what did not. The 10 430 and the 153.0 are the same node
 minutes apart, so they are comparable to each other; the older 6 370 in
 previous versions of this table was a different session and is superseded.
@@ -197,6 +197,109 @@ pieces, and it is the same change that step 2 needs: with more than one wave
 per block, `rocdl.readfirstlane` no longer reaches the whole block and the
 claim has to be broadcast through LDS. That single change unlocks the LDS
 staging of step 2 and the `s_barrier` that goes with it.
+
+### Round two: occupancy, and three theories that lost first
+
+At 153 ms/token the chain sustained 0.3% of HBM bandwidth and 0.07% of the
+FMA issue rate its own waves could manage, so the limit was neither. Three
+candidate explanations were each measured and each lost:
+
+| theory | the evidence for it | measured |
+|---|---|--:|
+| acquire-per-poll invalidates L2 | `buffer_inv sc0 sc1` in every spin, 1512 spins a launch | 4% |
+| claim atomics | 1024 contended cross-XCD returning atomics per stage, just to find the dies empty | ~0 |
+| no-op pieces | a window of 5 decoding 1 token claims 5 pieces per piece of work | ~0 |
+
+The peek-before-claim that removed 62% of the atomics changed nothing
+measurable; so did cutting the pieces per stage by 5x. When two independent
+ways of removing most of the atomics both do nothing, the atomics are not it.
+
+**rocprofv3 answered it in one line.** `grid 8192, block 64`, 92 VGPRs:
+
+```
+kernel                        grid  block          ms  vgpr  sgpr   lds
+chain_module                  8192     64      23.911    92   112     0
+```
+
+128 workgroups of one wavefront. MI300X holds 6080 wavefronts at 92 VGPRs.
+**2.1% of the wave slots, on 42% of the CUs, one wave per CU** -- and at one
+wave per CU there is nothing to hide a memory latency behind. That is the
+whole of the remaining gap, and it explains the bandwidth number exactly.
+
+Note what rocprof is for here: it did not find a hot spot, it found a shape.
+Three rounds of arithmetic about atomics and cache lines were all plausible
+and all wrong, and the thing that settled it was two numbers off the
+dispatch table.
+
+### Why more workgroups cannot fix it, and what Fleet does instead
+
+A stage's pieces are slices of its output, so the output width caps the
+wavefronts a column split can use:
+
+| stage | width | wavefronts, splitting columns |
+|---|--:|--:|
+| o_proj / down_proj | 1024 | 16 |
+| qkv | 4096 | 64 |
+| gate+up | 6144 | 96 |
+| lm head | 151936 | 2374 |
+
+Fleet names the same layer and the same problem: *"ALL 30 workers per XCD are
+active (processing all N-tiles) vs N-split which has only 8 tiles/XCD for
+O_proj"* (`gang_ksplit_linear_mi300.cuh:8`). Its answer is to split K. **That
+is the sixth Fleet mechanism, and this reproduction did not have it** -- the
+five in NEXT.md section 2.1 are all scheduling and coherence, and none of them
+puts work on an idle CU.
+
+### The herd widening (commit `fffb5ea3`)
+
+`air.herd` goes 1x1 -> Nx1, the waves divide the reduction, the lanes keep the
+columns so the weight reads stay coalesced, and the wave partials meet in LDS.
+`ds_write`/`ds_read`/`s_barrier` go from 0/0/0 to 21/70/44 -- the step-2
+counters from the original plan, finally positive, though for occupancy rather
+than for the HBM traffic they were predicted to save.
+
+Three things stop being free past one wave:
+
+- **the claim.** `rocdl.readfirstlane` is wave-scoped. Through LDS now.
+- **the event spin.** It was guarded by thread 0 *of the workgroup*, so waves
+  1..N-1 read the else value forever. That is a hang, not a wrong answer, and
+  it is what the first waves=8 run did.
+- **the release.** `vmcnt` is a wave counter: wave 0's `s_waitcnt` says nothing
+  about wave 5's stores, so the workgroup meets at a barrier before signalling.
+  **This cost 13% and the tests passed without it** -- 18/18 and the real
+  checkpoint, three times each. It is in anyway; a race that a correctness
+  suite cannot see is still a race.
+
+Measured, same node, slope over eight extra launches:
+
+| waves/workgroup | ms/token |
+|---|--:|
+| 1 | 163.6 |
+| 4 | 106.8 |
+| 8 | **69.8 / 62.9** |
+
+Embed, SwiGLU and the lm head take the whole workgroup (independent columns,
+distinct source and destination buffers); the lm head alone is a quarter of
+the work. Per-head rope and attention are still wave 0: rope reads both halves
+of a head and writes them back, so a second wave arriving late would rotate
+what the first already rotated.
+
+### What is left
+
+Still ~27x off Fleet (2.431 ms/token, MI350X, bf16), and the levers are now
+ordered by what the profile says rather than by the ISA diff:
+
+1. **More waves still.** 128 x 8 = 1024 of 6080 slots, 17%. The rmsnorms and
+   attention are still one wave in eight, which is the Amdahl term; a
+   block-wide reduction for them was written and backed out -- it gives 343
+   wrong elements at waves=8 and the bug is not yet found. `workspace/` has
+   the attempt.
+2. **Cross-workgroup K-split**, which is what Fleet actually does -- partial
+   GEMM into an f32 workspace with `atomicAdd`, then a finalize task. Within a
+   workgroup the split is bounded by the block; across workgroups it is not.
+3. **bf16.** Halves the weight traffic and is the precondition for `v_mfma`,
+   which is still 0. Worth doing after occupancy, not before: at 0.3% of
+   bandwidth an instruction that does 8192 MACs has nothing to eat.
 
 ### Measuring this at all
 
