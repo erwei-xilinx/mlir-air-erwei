@@ -220,6 +220,93 @@ suggests: on useful work it is **11.3x**, and `trc` already takes it to 6.0x.
 And copying Fleet's kernel exactly is not the target -- the target is its
 memory pipelining, not its matrix core.
 
+### What each loop actually waits for, from first principles
+
+**The mechanism.** AMD GPUs have no register scoreboard for memory. A load
+issues, the wave keeps running, and the *program* must insert `s_waitcnt`
+before reading the destination. Separate counters: `vmcnt` (vector memory),
+`lgkmcnt` (LDS, scalar, message), `expcnt`. Within a counter, returns are
+**in order** on CDNA -- so `s_waitcnt vmcnt(N)` ("at most N of mine are still
+outstanding") is equivalent to "the oldest issued-minus-N have landed". That
+turns a wait into a *positional* statement: to consume the k-th oldest
+outstanding load, wait `vmcnt(outstanding - k)`. Everything below follows from
+that one property.
+
+**Fleet, per GEMM iteration (measured, `.LBB5_1185`):**
+
+1. Issue **20 `buffer_load_dwordx4` back to back** -- 20 KB in flight per wave.
+2. One `s_waitcnt vmcnt(0)`. **One memory latency, for all twenty loads.**
+3. Ten `ds_write_b128` stage the tile.
+4. `s_waitcnt lgkmcnt(0)` + `s_barrier` -- publish the tile to the workgroup.
+5. `ds_read_b128` interleaved with `v_mfma`, separated by *partial*
+   `lgkmcnt(2)`, `lgkmcnt(3)`, `lgkmcnt(4)` waits: issue the next LDS reads
+   while older ones are outstanding, and wait only far enough to have the
+   operand the next MFMA needs.
+6. A second `vmcnt(0)` later in the body. So two full VMEM drains per
+   iteration -- but per **16 384 useful MACs**.
+
+An honest detail: the `vmcnt(18), vmcnt(17) ... vmcnt(10)` sequence that reads
+like textbook pipelining is **dead** -- there is no load between it and the
+`vmcnt(0)` above it, so the counts are already satisfied. Fleet's global-memory
+strategy is not "consume one load at a time while others fly"; it is "batch
+twenty, pay one latency". The real pipelining in this loop is on the *LDS*
+side, where the partial `lgkmcnt` waits are live.
+
+**Why waiting only for that is sufficient.** The correctness requirement for a
+load-to-use is "this destination register is written before it is read". It is
+*not* "the memory system is quiescent". Inside the loop the weights are
+read-only, the loads target distinct registers, and the only producer/consumer
+relationship is within the workgroup through LDS -- which `lgkmcnt(0)` +
+`s_barrier` covers exactly. There is nothing else any wave could be waiting to
+observe, so any stronger wait is waiting for work whose result nobody reads.
+
+**AIR, per GEMM iteration (measured, verbatim):**
+
+    global_load_ushort v13, v[30:31], off     ; weight
+    global_load_dword  v15, v[32:33], off     ; activation
+    v_lshl_add_u64 x3 ; v_cmp_lt_u64 ; s_or_b64
+    s_waitcnt vmcnt(1)      <- consume v13 with v15 still in flight
+    v_lshlrev_b32 v13, 16, v13
+    s_waitcnt vmcnt(0)      <- consume v15: FULL DRAIN
+    v_mul_f32 / v_add_f32
+    s_andn2_b64 exec, exec, s[44:45] ; s_cbranch_execnz
+
+The waits are *locally* optimal -- `vmcnt(1)` is a genuine positional wait and
+LLVM did the best it could with what it was given. The redundancy is not a
+wasted instruction, it is a **wasted ordering constraint**: with only two loads
+in flight, `vmcnt(0)` is reached every iteration, so the next iteration's loads
+are not issued until this one's have landed *and been consumed*. Every MAC pays
+a serialized HBM round trip.
+
+| full VMEM drains per useful MAC | |
+|---|--:|
+| Fleet | 1 per 8 192 |
+| AIR head | 1 per 64 -- **128x more often** |
+| AIR trc | 1 per 1 024 -- 8x more often |
+
+`trc`'s wait sequence is `vmcnt(24)`, then `16, 15, 14 ... 8`, then one
+`vmcnt(0)`: the counted loop reproduces Fleet's shape, and its descending waits
+are *live* because the sixteen loads really are issued before any is consumed.
+
+**Three causes, in order:**
+
+1. **Nothing to overlap with.** Pipelining needs more than one iteration's
+   loads in the body, which needs unrolling, which needs a provable trip count.
+   `for i = lid to N step 64` with dynamic `lid` has none -- LLVM cannot even
+   prove one iteration runs. Same root cause as the 64-bit addressing.
+2. **A loop-carried accumulator.** `v_add_f32 v3, v3, v13` serialises the
+   arithmetic too. Fleet's 32 MFMAs write several independent accumulators.
+3. **Divergent loop control.** `s_andn2_b64 exec, exec` / `s_cbranch_execnz` --
+   a uniform loop compiled as a per-lane one, because the trip count looks
+   lane-dependent. Blocks further transformation.
+
+**A hypothesis I tested and killed.** I expected AIR's `gpu.barrier` to lower
+to `s_waitcnt vmcnt(0) lgkmcnt(0)`, which would make every one of its 76
+barriers throw away all memory parallelism. It does not: the `s_waitcnt`
+preceding every `s_barrier` is `lgkmcnt(0)` in **both** kernels, 31 in AIR and
+36 in Fleet. AIR's barriers are LDS-scoped, exactly like Fleet's, and are not
+the redundant sync. The redundancy is entirely inside the GEMM loop.
+
 ### What to do, in order
 
 1. **Vector loads.** `vector<8xbf16>` on the weights takes bytes-per-load from
