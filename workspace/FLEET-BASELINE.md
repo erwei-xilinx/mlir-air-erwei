@@ -697,6 +697,66 @@ and every memory access is exposed. That is the frame for the next round --
 more workgroups (which needs a ragged vocab split, since 151936 = 2^7 x 1187
 and `tasks` must divide it), or more independent loads in flight per thread.
 
+### Which nodes can actually run this (2026-09-17)
+
+Not a detail -- it cost an hour.
+
+| partition | node | runs the kernels? |
+|---|---|---|
+| `mi300x` | `rad-mi300x-2` | **yes**, and every number in this file is from it |
+| `mi300x-es` | `rad-mi300x-splinter1` | **no** |
+| `mi350x-es` | | yes, see "Running on MI350" |
+
+`rad-mi300x-splinter1` reports `gfx942`, `NPS1, SPX`, one full GPU, and `/shared`
+is mounted -- but **/home is a fresh local home, the repo is not there**, and
+once a staged copy is in `/shared` and the toolchain runs, every kernel hangs.
+A one-layer 64-wide megakernel times out at 150 s, and so does `4k_4k_mul`,
+which has no chiplet logic in it at all -- so it is the node, not the
+persistent-worker protocol. `rocm-smi` shows 0% GPU while `mlir-runner` sits in
+`D` state in `amddrm_sched_entity_flush`. Do not spend time on it.
+
+What the node *is* good for is **compilation**, which needs no GPU: `air-opt`
+and `mlir-opt` run fine there off `/shared/erweiw/airtree`. `workspace/env.shared.sh`
+sources that copy. That is how the ISA comparison below was taken while the
+only working node was four hours down a 114-job queue.
+
+### Two changes written but not yet measured
+
+Both are on `erwei/air-gpu-wip`, both are labelled UNMEASURED in their commit
+messages, and neither should be believed until it has a number.
+
+**1. Give each die a contiguous block of pieces, not a stride.** A piece is a
+slice of output columns. At 128 tasks over a 1024-wide output that is 8 columns
+a piece and 64 a die -- exactly the 64 bf16 in one 128-byte line. The strided
+mapping gives all sixteen dies a different eighth of the *same* line, so every
+die fetches line 0 of every row of the weight matrix and uses an eighth of it.
+The bound becomes two-sided: a die stops at the end of its own block as well as
+at the end of the grid.
+
+**2. Weights [out][in], and one output column per wavefront.** These are only
+worth anything together. With [in][out] and a lane per column, one load
+instruction's 64 lanes ask for 8 adjacent bf16 in each of 8 different rows:
+eight lines fetched to use one line's worth. Transposing alone just runs the 16
+bytes along `i` instead of `j`. With [out][in] *and* one column per wave, the
+64 lanes ask for `i = lid .. lid+63` of a single row -- one line, every byte
+used -- and the cross-wave combine disappears, because a column then belongs to
+one wave outright.
+
+`workspace/isa_cmp.sh` compiles a variant to gfx942 and counts, no GPU:
+
+| | head | transposed |
+|---|--:|--:|
+| `ds_read` | 198 | **22** |
+| `s_barrier` | 76 | 66 |
+| `ds_bpermute` | 8 | 20 |
+| VGPRs | 119 | **74** |
+
+119 VGPRs is four waves a SIMD; 74 is six. That is the right direction for a
+kernel whose problem is under one wave per SIMD. **But these are instruction
+counts, and four of this session's six theories built on instruction counts
+were wrong.** `workspace/waitbench.sh` has both variants queued against the
+unchanged generator, interleaved, two rounds at HI=300.
+
 ### What is left, in the order the measurements rank it
 
 1. **Cross-workgroup K-split** -- Fleet's `gang_ksplit_linear_mi300.cuh`:
