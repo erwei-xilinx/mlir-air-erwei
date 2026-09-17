@@ -33,7 +33,7 @@ latency, comparable with the torch row.
 | Fleet `fleet` M-tile | MI350X | bf16 | 2.591 | 4.0x faster |
 | torch / HF eager | MI350X | bf16 | **10.48** | 1x |
 | AIR, before this work | MI300X | f32 | 10 430 | 1 000x slower |
-| AIR, **now** | MI300X | bf16 | **18.1** | 1.7x slower |
+| AIR, **now** | MI350X | bf16 | **8.85** | 1.2x faster |
 | AIR (as measured earlier) | MI350X | f32 | 28 700 | 2 740x slower |
 
 The AIR row moved by **576x** on 2026-09-16/17; see "Closing the gap" below for
@@ -318,6 +318,86 @@ the redundant sync. The redundancy is entirely inside the GEMM loop.
    lowering; worth it for the 32-bit addressing alone.
 4. **MFMA last, and only with a K-split or multi-token M.** At M=1 it is a
    regression.
+
+## Round six: measure the operators, 16.78 -> 8.85 ms/token (2026-09-17)
+
+**Everything before this section that ranks stages by cost was inferred by
+subtraction and several of its conclusions were wrong.** `gen.py --timers`
+now reads `s_memrealtime` at the top, middle and bottom of every stage and
+accumulates body and rendezvous-wait per stage class, from one workgroup so
+the counter cannot overflow and one wall-clock window is not counted `workers`
+times. One run prints all fourteen operators. Off by default; the IR with it
+off is byte-identical.
+
+### What it said, and what that cost me
+
+| | ms/token | |
+|---|--:|---|
+| start | 16.78 | |
+| lm head weight held `[vocab][dim]` | 15.42 | -1.36 |
+| chiplet queues probed: 16 -> 8 | 10.57 | **-4.85** |
+| a drained queue sets a flag instead of being claimed again | 8.85 | **-1.70** |
+
+**1.90x, and all three are scheduling, not kernel quality.** Nothing to do with
+MFMA, memory layout, load width or any of the three artifact differences the
+ISA diff found. Every strided stage, on every workgroup, did a device-scope
+atomic claim against all sixteen chiplet queues to discover that fifteen of
+them had nothing -- 1176 times per decode.
+
+The lm head is the one layout win and it is a DRAM-page effect, not coalescing:
+that weight is 1024 x 151936 = 311 MB, and held `[dim][vocab]` one output
+column steps 304 KB per reduction step, so a single output touches a thousand
+separate pages. Held `[vocab][dim]` each thread streams a contiguous 2 KB row.
+**Only the lm head.** Transposing every weight was measured too and all four
+layer matmuls got worse for it (qkv +0.24, gate_up +0.18, o_proj +0.15, down
++0.11) -- those are 2-6 MB and never had the page problem.
+
+### Two hypotheses measured and rejected, before the one that worked
+
+- **The broadcast barriers.** Dropping one of the broadcast's two barriers:
+  10.530 vs 10.594. Nothing.
+- **False sharing on the queue counters.** A 128-byte line each: 10.536 ->
+  10.663, *worse*.
+
+That is what left the atomic itself, and the flag.
+
+### The control that is in every one of these tables
+
+`single_stage` claims once, from one queue, and never probes. `strided_stage`
+probes every queue. Across all three changes **the single-task stages did not
+move** -- rmsnorm 0.120 -> 0.113 -> 0.127, final_norm and argmax_reduce flat --
+while every probing stage fell in proportion to how often it runs. The
+hypothesis and its control arrive in the same run.
+
+### Where the 8.85 ms is now
+
+| operator | ms/token | % |
+|---|--:|--:|
+| gate_up | 2.41 | 27% |
+| qkv | 1.72 | 19% |
+| down | 1.56 | 18% |
+| o_proj | 1.21 | 14% |
+| swiglu | 0.46 | 5% |
+| attention | 0.41 | 5% |
+| rope + kv_append | 0.38 | 4% |
+| lm_head | 0.27 | 3% |
+| everything else | 0.44 | 5% |
+
+The four layer matmuls are 6.90 of 8.85, **78%**. The rendezvous wait across
+all stages was 11.5% before this round -- the stages are not bounded by a
+straggler, the bodies are the cost.
+
+### And the end-to-end harness cannot see any of this
+
+`bench.sh` takes the slope of wall clock against launch count, over a ~60 s
+fixed cost that wanders by ~3 s. Divided by 299 launches that is **+/-1.7
+ms/token**, not the +/-0.5 claimed for HI=300. The same build measured 19.8 and
+16.6 on consecutive rounds. **Every ranking taken with it below 3 ms is void,
+including "all five GEMM variants are slower"** -- the per-operator timer says
+the transposed variant was in fact 0.58 ms *better*, and that all of its win
+was the lm head.
+
+Use `--timers` to rank a change. Use `bench.sh` only to confirm a large one.
 
 ## Closing the gap: 10 430 -> 153 ms/token, 2026-09-16
 
