@@ -757,6 +757,44 @@ counts, and four of this session's six theories built on instruction counts
 were wrong.** `workspace/waitbench.sh` has both variants queued against the
 unchanged generator, interleaved, two rounds at HI=300.
 
+**3. Make the reduction loop's trip count a literal.** Found by reading the
+assembly rather than guessing, and it may be the biggest of the three. The
+matmul inner loop is *thirteen instructions for one multiply-add*:
+
+    global_load_ushort v5,  v[38:39], off
+    global_load_dword  v33, v[40:41], off
+    v_lshl_add_u64     v[42:43], v[42:43], 0, 64        <- induction variable
+    v_cmp_lt_u64       vcc, s[38:39], v[42:43]          <- bound test
+    v_lshl_add_u64     v[38:39], v[38:39], 0, s[34:35]  <- weight address
+    v_lshl_add_u64     v[40:41], v[40:41], 0, s[36:37]  <- activation address
+    ... s_waitcnt, two shifts, v_mul_f32, v_add_f32
+
+Three 64-bit address adds and a 64-bit compare, none of it arithmetic. **That
+is what round four's "two thirds of the body is neither load" actually was**,
+and the head and transposed variants have the identical loop -- the transpose
+does not touch it.
+
+The cause is that the loop is written `for i = lid to N step 64`. `lid` is
+dynamic, so LLVM cannot prove the trip count, cannot prove the loop runs even
+once, will not unroll, and has to carry a 64-bit induction variable. Written
+`for k = 0 to N/64` with `i = k*64 + lid` the trip count is a literal. The
+assembly then becomes one base register and sixteen `offset:` immediates:
+
+    global_load_ushort v3,  v[32:33], off
+    global_load_ushort v5,  v[32:33], off offset:128
+    global_load_ushort v9,  v[32:33], off offset:256
+    ... sixteen of them, then one s_waitcnt
+
+**Sixteen loads in flight per thread instead of one.** For a kernel whose
+problem is "under one wave per SIMD, so every latency is exposed", memory-level
+parallelism inside the thread is the lever that does not need more waves.
+
+It is a real trade, not a free win: VGPRs go 74 -> 107 on the transposed base,
+which is four waves a SIMD instead of six. Sixteen loads in flight on four
+waves against one on six is still 10x the outstanding traffic, but that is
+arithmetic on a whiteboard. `workspace/scratch/mk_countloop.py` builds it on
+either base and `waitbench2.sh` has it queued.
+
 ### What is left, in the order the measurements rank it
 
 1. **Cross-workgroup K-split** -- Fleet's `gang_ksplit_linear_mi300.cuh`:
