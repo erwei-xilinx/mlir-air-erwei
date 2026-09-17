@@ -38,8 +38,26 @@ latency, comparable with the torch row.
 
 The AIR row moved by **576x** on 2026-09-16/17; see "Closing the gap" below for
 what did it and what did not. Read 18.1 as 18.1 +/- 1.5 -- see the correction
-in "Measuring this at all". Like-for-like against Fleet's 2.431 the gap is
-**7.4x**, down from 9.2x. The 10 430 and the 153.0 are the same node
+in "Measuring this at all"; the same snapshot also measured 19.6.
+
+**The gap against Fleet, on consistent bases** (an earlier version of this line
+divided the raw 18.1 by 2.431 and called the result like-for-like next to the
+old *adjusted* 9.2x -- two different bases, which flattered the new number):
+
+| basis | before | now |
+|---|--:|--:|
+| raw headline / Fleet 2.431 | 9.8x | **7.4x** (8.1x at the 19.6 control) |
+| like-for-like: pure decode, on MI350X | 9.2x | **7.0x** (7.6x at 19.6) |
+
+Like-for-like removes two confounds, both derived below: the headline averages
+one 5-token prefill step with five decode steps (x0.879 to pure decode), and
+Fleet's number is on MI350X where AIR is 1.07x slower. Net x0.94. **The 0.879
+is carried over from the 23.9 measurement and has not been re-measured since
+attention and rmsnorm changed the decode/prefill mix**, so the like-for-like
+row is the weaker of the two. Either way this stretch is 1.3x.
+
+The denominator has its own error bar: Fleet's 2.431 is a single sample, see
+the caveat below. The 10 430 and the 153.0 are the same node
 minutes apart, so they are comparable to each other; the older 6 370 in
 previous versions of this table was a different session and is superseded.
 
