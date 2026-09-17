@@ -455,9 +455,19 @@ garbage in the kernel and is not used. What is known:
 - `gpu.shuffle xor` with offset 32 across 8 waves is fine on its own
   (thread 64 gets 64+96=160).
 
-Every working use of `gpu.shuffle` in this generator sits inside
-`scf.if %isW0`; this one does not. That is the remaining difference and it is
-not yet chased. Worth roughly 20-30% when it is.
+**And it is not the shuffle.** The same fold written with no shuffles at all --
+every lane adds its `klanes` partners out of LDS, then wave 0 adds the `waves`
+per-wave totals, three barriers, `klanes + waves` deep instead of
+`klanes * waves` -- fails in exactly the same way, 377 elements wrong. Two
+independent mechanisms for the same logical fold, both correct on the page and
+in the emitted IR, both wrong on the device.
+
+What the two failing versions share, and what the working one does not, is the
+intermediate per-wave total: the version that works reads the raw per-lane
+slots and adds `waves * klanes` of them in one loop. So the thing to suspect is
+the lane-to-slot mapping the intermediate step assumes, not the shuffle and not
+LDS. Worth roughly 20-30%, and the combine is the largest single item in the
+body, so it is worth going back to with fresh eyes.
 
 ### What is left, in the order the measurements rank it
 
