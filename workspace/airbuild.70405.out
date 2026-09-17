@@ -1,0 +1,37 @@
+Welcome to SLURM
+--------------------------------------------
+current Job id 70405
+--------------------------------------------
+=== node: rad-mi300x-1  glibc: ldd (Ubuntu GLIBC 2.39-0ubuntu8.7) 2.39 ===
+LLVM (http://llvm.org/):
+  LLVM version 23.0.0git
+lit: /scratch/erweiw/sandbox/bin/lit
+Python 3.12.3
+
+=== configure ===
+CONFIGURE FAILED
+CMake Error at CMakeLists.txt:32 (project):
+  The CMAKE_CXX_COMPILER:
+
+    /tmp/llvm22/LLVM-22.1.8-Linux-X64/bin/clang++
+
+  is not a full path to an existing compiler tool.
+
+  Tell CMake where to find the compiler by setting either the environment
+  variable "CXX" or the CMake cache entry CMAKE_CXX_COMPILER to the full path
+  to the compiler, or to the compiler name if it is in the PATH.
+
+
+CMake Error at CMakeLists.txt:32 (project):
+  The CMAKE_C_COMPILER:
+
+    /tmp/llvm22/LLVM-22.1.8-Linux-X64/bin/clang
+
+  is not a full path to an existing compiler tool.
+
+  Tell CMake where to find the compiler by setting either the environment
+  variable "CC" or the CMake cache entry CMAKE_C_COMPILER to the full path to
+  the compiler, or to the compiler name if it is in the PATH.
+
+
+-- Configuring incomplete, errors occurred!

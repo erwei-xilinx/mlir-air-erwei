@@ -1,0 +1,15 @@
+layers = 2
+tokens = 2
+steps = 4
+query heads = 4
+device-scope event flushes = 544
+what signalling per worker would have been = 2176
+output elements differing from the reference = 109
+logit elements differing from the reference = 231
+reference tokens:101
+101
+101
+0
+0
+tokens differing from the reference = 1
+total differences = 341

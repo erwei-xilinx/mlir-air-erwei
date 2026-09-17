@@ -33,10 +33,10 @@ latency, comparable with the torch row.
 | Fleet `fleet` M-tile | MI350X | bf16 | 2.591 | 4.0x faster |
 | torch / HF eager | MI350X | bf16 | **10.48** | 1x |
 | AIR, before this work | MI300X | f32 | 10 430 | 1 000x slower |
-| AIR, **now** | MI300X | f32 | **66** | 6x slower |
+| AIR, **now** | MI300X | f32 | **41.7** | 4x slower |
 | AIR (as measured earlier) | MI350X | f32 | 28 700 | 2 740x slower |
 
-The AIR row moved by **158x** on 2026-09-16/17; see "Closing the gap" below for
+The AIR row moved by **250x** on 2026-09-16/17; see "Closing the gap" below for
 what did it and what did not. The 10 430 and the 153.0 are the same node
 minutes apart, so they are comparable to each other; the older 6 370 in
 previous versions of this table was a different session and is superseded.
@@ -301,20 +301,93 @@ ordered by what the profile says rather than by the ISA diff:
    which is still 0. Worth doing after occupancy, not before: at 0.3% of
    bandwidth an instruction that does 8192 MACs has nothing to eat.
 
-### Measuring this at all
+### Round three: the barrier is 59% of a decode launch
 
-Two-point slopes over `--repeat` have a ~2 s noise floor against a fixed cost
-of ~69 s (three gigabytes of weights off NFS, plus the single-threaded host
-reference). At `1 -> 3` launches the signal is ~1.4 s and **the measurement is
-worthless** -- it produced a 55.0 ms/token that did not reproduce and a 229.7
-from the same snapshot minutes later. At `1 -> 9` the spread between repeats
-is under 1%. `workspace/bench.sh` does the wide version, always runs from a
-snapshot of the generator (editing it mid-run silently gives the two halves of
-a measurement two different programs -- that happened once), and logs
-`squeue -w $(hostname)` around every measurement.
+Four more changes, each measured, and one measurement method that finally works.
 
-`workspace/isa.sh` is the other half: it compiles the generated chain to gfx950
-assembly and counts these instructions in **0.6 s**, no GPU involved.
+| change | ms/token |
+|---|--:|
+| after the herd widening | 71.0 |
+| one wave waits for the workgroup, acquire once not per poll | 45 |
+| per-head norm and rope off a single thread | 44.7 |
+| weights not loaded non-temporally | **41.7** |
+
+The first is the same relaxed-poll change that measured **1.4% worse** at 128
+single-wave workgroups and was reverted (`c63e34bf`) with a note saying it
+would matter if occupancy rose. It rose: widening the herd multiplied the
+pollers by eight without anyone deciding to, because the spin had been made
+per-wave to fix a hang. One wave waits and a barrier releases the rest -- the
+workgroup meets before the next claim anyway -- and that is worth 1.58x.
+
+The second was a stage running on **one thread of five hundred and twelve**:
+stage 2's per-head rmsnorm, rope and KV append, 168 times a launch.
+
+The third contradicts the reasoning that put it there. Weights are read once a
+layer and dwarf everything else, so they look like the textbook non-temporal
+load; they are 7% faster kept. It also settles the "honest non-match" recorded
+above -- Fleet's batch-1 build emits no `nt` at all, and now neither does this.
+
+**Two more theories died, and this time the numbers can be trusted.** Agent
+scope instead of system scope on all six event atomics: 44.5/44.8 against
+44.6/44.4, i.e. nothing. Moving the acquire fence onto the one waiting wave
+instead of all eight: nothing. Cache-maintenance scope is simply not where the
+time is.
+
+### What the time is, measured rather than argued
+
+Same number of stage boundaries, five times the work per stage (a 30-token
+prompt at window 5 against a 6-token prompt at window 1):
+
+```
+nat=5   0.555 s/launch
+nat=1   0.209 s/launch
+T = A + B*W  ->  A = 0.1225 s, B = 0.0865 s
+```
+
+**59% of a decode launch is fixed per-stage cost and 41% is work.** That is
+81 us of pure barrier at each of the 1512 stage boundaries. The work half moves
+10.6 GB in 0.087 s = 123 GB/s, which is 2.3% of HBM -- so the work is still
+twenty times off its own latency-bound model too.
+
+A layer sweep says where the stages are: 28 layers is **91%** of the launch
+(0.245 s at 28, 0.143 at 14, 0.014 at 1). The lm head and the embed are not
+the problem, the layers are.
+
+So the two remaining targets, in the order the measurement ranks them:
+
+1. **81 us per device-wide barrier, 1512 times.** Not the cache ops -- both
+   scope experiments came back flat. Most likely the arrival storm itself:
+   128 workgroups onto 8 counters across 8 XCDs, plus whatever straggler the
+   barrier is waiting for. Fusing SwiGLU into the gate/up matmul would remove
+   one of nine barriers a layer if a piece covered (gate_j, up_j) pairs
+   instead of a contiguous slice of the concatenated output.
+2. **Cross-workgroup K-split**, for the work half. 128 workgroups of 512
+   threads occupy at most 128 of 304 CUs, and more workgroups than pieces is
+   measurably worse (256 workers against 128 tasks: 48.6 against 44.7). More
+   pieces needs K split across workgroups, which is Fleet's
+   `gang_ksplit_linear_mi300.cuh`: partial GEMM into an f32 workspace by
+   atomicAdd, then a finalize task.
+
+### Measuring this at all -- 100 launches, not 3, and not 9
+
+The launch slope is ~0.25 s against a fixed cost of ~63 s (three gigabytes off
+NFS plus a single-threaded host reference). At `--repeat 1 -> 3` the signal is
+under the noise and the numbers are fiction: one pair read 55.0 and 229.7
+ms/token for the *same* generator snapshot. At `1 -> 9` it is about 20%: the
+same code measured 40.1 in one batch and 50.4 in the next, which is enough to
+invent a win that is not there. At `1 -> 100` four repeats of two variants came
+back 44.5 / 44.6 / 44.8 / 44.4 -- under 1%, and it costs about 20 seconds more
+per run than `1 -> 9` because the fixed cost dominates either way.
+
+**Use `LO=1 HI=100`.** Every number in the round-three table is from it, and
+the agent-scope and fence-placement nulls above are only believable because of
+it.
+
+Two process failures worth keeping: a relaunch once raced a copy of `bench.sh`
+that had not died, and a whole batch was collected with two runs sharing the
+GPU -- `bench.sh` now takes a `flock` and refuses. And the tree was twice
+edited or branch-switched underneath a running measurement, which is why
+`bench.sh` snapshots the generator before it starts.
 
 ## What the README says to run
 
