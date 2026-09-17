@@ -33,11 +33,13 @@ latency, comparable with the torch row.
 | Fleet `fleet` M-tile | MI350X | bf16 | 2.591 | 4.0x faster |
 | torch / HF eager | MI350X | bf16 | **10.48** | 1x |
 | AIR, before this work | MI300X | f32 | 10 430 | 1 000x slower |
-| AIR, **now** | MI300X | bf16 | **23.9** | 2.3x slower |
+| AIR, **now** | MI300X | bf16 | **18.1** | 1.7x slower |
 | AIR (as measured earlier) | MI350X | f32 | 28 700 | 2 740x slower |
 
-The AIR row moved by **436x** on 2026-09-16/17; see "Closing the gap" below for
-what did it and what did not. The 10 430 and the 153.0 are the same node
+The AIR row moved by **576x** on 2026-09-16/17; see "Closing the gap" below for
+what did it and what did not. Read 18.1 as 18.1 +/- 1.5 -- see the correction
+in "Measuring this at all". Like-for-like against Fleet's 2.431 the gap is
+**7.4x**, down from 9.2x. The 10 430 and the 153.0 are the same node
 minutes apart, so they are comparable to each other; the older 6 370 in
 previous versions of this table was a different session and is superseded.
 
@@ -630,6 +632,71 @@ Ranked by measured cost, and CK is third:
    and it forces the `[out][in]` transpose and the K-split anyway, but it is
    not the first thing to do and it is not sufficient.
 
+### Round five: the two decomposition mistakes, fixed -- 23.7 -> 18.1
+
+Round four ranked the work by measured cost and said the top two items were
+not kernel quality at all but task decomposition, and that CK could not touch
+either. Both are now fixed, and both paid what the ablation said they would.
+
+| change | ms/token | what it was |
+|---|--:|---|
+| control | 23.7 | |
+| attention over waves, lanes over the head | 20.4 | 4.3 ms at 1.6% occupancy |
+| the three rmsnorms over the whole block | 18.1 | 1.9 ms at 0.1% occupancy |
+
+**Attention.** A lane per key position is the obvious decomposition and it is
+the wrong one at batch one. `curlen` is the sequence so far -- ten, in this
+benchmark -- so ten lanes of a 512-thread workgroup did the work, and each
+walked a 128-deep dependent FMA chain down the head. The head is the only axis
+with any width at decode, so a wave now owns one key position and its 64 lanes
+split the head, folded with the same xor butterfly the rmsnorm already used;
+the waves take key positions in turn. The softmax stays on wave 0 because it
+rewrites the slots it reads and eight waves repeating it would race over the
+same addresses; it publishes its divisor through LDS. 3.3 ms of the 4.3.
+
+**rmsnorm.** Still one task -- a row reduction cannot be split by output slice
+-- so 127 workgroups still wait at the barrier. What changed is that the one
+workgroup was using an eighth of itself. The fix is one line of decomposition
+and one line of bug: **`single_stage` treated any truthy `lanes` as "wave 0
+only"**, so a body that reduced across waves ran with seven of them not there
+and its barriers were barriers only one wave reached. That is almost certainly
+why the block reduce was tried here once before, came back wrong, and was
+backed out. It works now.
+
+The generalisation, and it is the one to carry forward: **every stage that was
+written for a single wavefront is suspect.** Three of the four found so far
+were the same bug in different clothes.
+
+### The argmax experiment, and why it was thrown away
+
+`argmax_partial` scans `vocab/tasks` = 1187 logits **on the lead thread
+alone**, which looks like exactly the same mistake. Spreading it over the block
+(plus an index-carrying butterfly, ties to the lower index) measured 18.7, and
+spreading only that half measured 19.5, against a control of 18.1 -- and then
+the *unchanged* control re-measured at 19.6. All four numbers are one
+population. Reverted.
+
+The reason it was never going to be a win is arithmetic that should have been
+done first: the lm head is 151936 x 1024 = 156M MACs per token against 152K
+compares for the argmax, a factor of a thousand. The 3.3 ms the ablation
+attributed to "lm head + argmax" is the matmul, not the scan.
+
+### Where the remaining 18 ms is not
+
+Worth writing down because it rules out three whole families of fix:
+
+- **Not arithmetic.** 523M MACs per token at 18 ms is 29 G MAC/s, which is
+  0.04% of what the vector units can do.
+- **Not bandwidth.** ~1 GB of bf16 weights per token at 18 ms is 58 GB/s
+  against 5300, or 1.1%. This is the same null the bf16 change already gave.
+- **Not occupancy of the workgroup** any more, for the stages above.
+
+What is left is **latency with nothing to hide it behind**: 128 workgroups of
+512 threads is 1024 wavefronts against 1216 SIMDs, so under one wave per SIMD,
+and every memory access is exposed. That is the frame for the next round --
+more workgroups (which needs a ragged vocab split, since 151936 = 2^7 x 1187
+and `tasks` must divide it), or more independent loads in flight per thread.
+
 ### What is left, in the order the measurements rank it
 
 1. **Cross-workgroup K-split** -- Fleet's `gang_ksplit_linear_mi300.cuh`:
@@ -657,6 +724,20 @@ per run than `1 -> 9` because the fixed cost dominates either way.
 **Use `LO=1 HI=100`.** Every number in the round-three table is from it, and
 the agent-scope and fence-placement nulls above are only believable because of
 it.
+
+**Correction, 2026-09-17: "under 1%" was the resolution of that hour, not of
+the method.** The same snapshot (md5 `2b1409eb40a1`) measured 18.1 and then
+19.6 ms/token twenty minutes apart on rad-mi300x-2 with nobody else on the
+node, both at `1 -> 100`. The resolution is (fixed-cost jitter) / (HI - LO) and
+nothing else: the fixed cost is ~80 s and wanders by about half a second, so
+at HI=100 the floor is ~1.5 ms/token and at HI=300 it is ~0.5 ms for 35 s more
+per run. Two round-four changes below are well outside that; the argmax
+experiment was entirely inside it and was thrown away because of it.
+
+The rule that follows: **before believing a difference, re-measure the
+*unchanged* snapshot in the same session.** A control taken an hour ago is not
+a control. `bench.sh` now defaults to HI=100 rather than 3 and carries the
+table.
 
 Two process failures worth keeping: a relaunch once raced a copy of `bench.sh`
 that had not died, and a whole batch was collected with two runs sharing the

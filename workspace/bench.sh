@@ -40,8 +40,23 @@ ALTGEN="${2:-}"
 export QWEN_DIR="${QWEN_DIR:-/shared/erweiw/qwen3-0.6b}"
 export PY="${PY:-/shared/erweiw/venv/bin/python}"
 export STEPS="${STEPS:-6}"
+# The slope is taken against a fixed cost of about 80 s that varies by roughly
+# half a second run to run, so the resolution is (fixed-cost jitter) / (HI - LO)
+# and nothing else. Measured on rad-mi300x-2, 2026-09-17:
+#
+#   HI     signal    same snapshot twice        resolves
+#     3     0.4 s    55.0 and 229.7 ms/token    nothing
+#     9     1.1 s    40.1 and 50.4              nothing under 10 ms
+#   100    11.7 s    18.1 and 19.6              nothing under 1.5 ms
+#   300    35 s                                 ~0.5 ms, at +35 s a run
+#
+# The 100 row is the correction: an earlier batch of four runs agreed to under
+# 1% and that was read as the resolution of the method. It is not -- it was the
+# resolution of that hour. Use 100 to rank changes worth several ms and 300 for
+# anything smaller, and never believe a difference smaller than a repeat of the
+# *same* snapshot taken in the same session.
 LO="${LO:-1}"
-HI="${HI:-3}"
+HI="${HI:-100}"
 
 # Always run out of a snapshot, never out of the tree. A run takes minutes and
 # regenerates the IR each time; editing the generator while one is in flight
