@@ -33,10 +33,10 @@ latency, comparable with the torch row.
 | Fleet `fleet` M-tile | MI350X | bf16 | 2.591 | 4.0x faster |
 | torch / HF eager | MI350X | bf16 | **10.48** | 1x |
 | AIR, before this work | MI300X | f32 | 10 430 | 1 000x slower |
-| AIR, **now** | MI300X | f32 | **41.7** | 4x slower |
+| AIR, **now** | MI300X | bf16 | **23.9** | 2.3x slower |
 | AIR (as measured earlier) | MI350X | f32 | 28 700 | 2 740x slower |
 
-The AIR row moved by **250x** on 2026-09-16/17; see "Closing the gap" below for
+The AIR row moved by **436x** on 2026-09-16/17; see "Closing the gap" below for
 what did it and what did not. The 10 430 and the 153.0 are the same node
 minutes apart, so they are comparable to each other; the older 6 370 in
 previous versions of this table was a different session and is superseded.
@@ -367,6 +367,110 @@ So the two remaining targets, in the order the measurement ranks them:
    pieces needs K split across workgroups, which is Fleet's
    `gang_ksplit_linear_mi300.cuh`: partial GEMM into an f32 workspace by
    atomicAdd, then a finalize task.
+
+### Round four: ablation, and the end of guessing
+
+Six theories had been argued from instruction counts and four of them were
+wrong. The fix was to stop proposing candidate changes to learn things and
+build **deliberately-broken diagnostic builds instead** -- each removes exactly
+one cost, none is shippable, and together they partition the time. `bench.sh
+DIAG=1` tolerates their wrong answers.
+
+| build | ms/token |
+|---|--:|
+| control | 41.3 / 40.8 |
+| arrival release -> monotonic (drops 128 L2 writebacks/stage) | 41.1 |
+| flush release -> monotonic (drops 8 system writebacks/stage) | 40.8 |
+| **no rendezvous at all** | **35.9** |
+| no rendezvous, no flush | 35.6 |
+
+**The entire event protocol -- all 1512 barriers, every atomic -- is 13%.**
+The task bodies are 87%. So the "59% fixed cost" recorded above was misread:
+that term is the N-direction reduction work, which does not scale with the
+token count either. The cache-maintenance scope experiments were chasing 1%.
+
+That is also the answer to whether lowering through CK matters. Fleet's task
+bodies are CK tile GEMMs -- `v_mfma_f32_16x16x32_bf16`, LDS staging,
+ColumnMajor B, software pipelining. With a *free* scheduler this chain would
+still sit at 35.6 against Fleet's 2.431. **The kernel body is the gap**, and
+the round-one ISA diff said so before two rounds of occupancy work displaced
+it. The occupancy work was worth most of the 436x; it just was not the answer
+to the question being asked.
+
+### What the body is actually spending
+
+Same method, one load at a time made loop-invariant so the compiler hoists it:
+
+| build | ms/token | |
+|---|--:|---|
+| control | 24.4 | |
+| activation load hoisted | 22.9 | loads of `lhs[m,i]` are **6%** |
+| weight load hoisted | 17.9 | loads of `W[i,j]` are **27%** |
+
+So two thirds of the body is neither load. It is loop overhead and the LDS
+combine -- and the combine is the striking one: a piece is `width/tasks`
+columns, which at 128 tasks is 8 for anything dim-wide, so a stage's 16384 MACs
+spread over 512 threads is **32 MACs per thread**, while the cross-lane combine
+reads `waves * klanes` = **64 LDS slots per column**. The bookkeeping costs
+twice the arithmetic.
+
+**bf16 is worth exactly nothing in time** (24.6 against 24.7) and that null is
+the most useful measurement in this section: halving the bytes changes nothing,
+so the decode is not bandwidth-bound -- it is at 1.8% of HBM -- and what costs
+is the *number* of memory instructions, which bf16 does not change.
+
+### Round-four changes
+
+| change | ms/token |
+|---|--:|
+| after round three | 41.7 |
+| lanes split across columns **and** the reduction | 24.5 |
+| weights read as the bf16 they already are | 24.6 (a wash, kept anyway) |
+| no software divide to learn the token index is 0 | **23.9** |
+
+The first is the big one. A lane per column left 8 of 64 lanes busy on o_proj
+and down_proj and used 32 bytes of every 128-byte line; splitting the lanes two
+ways fills the wave whatever the slice is. 3.7x of arithmetic was being thrown
+away and 1.71x of it came back.
+
+The last is small but worth naming: `%k % %nat` with `%nat` a runtime value is
+a 64-bit software divide, about thirty instructions, on a path taken up to nine
+times per workgroup per stage -- the same order as the MAC loop of the piece it
+wins. At decode `%nat` is 1.
+
+### An unexplained failure, left in the open
+
+`lane_reduce` -- an xor butterfly folding the k-lanes inside a wave before LDS,
+which would cut the combine from `waves * klanes` slots to `waves` -- produces
+garbage in the kernel and is not used. What is known:
+
+- the emitted sequence is correct in isolation. A 512-thread kernel running the
+  exact two shuffles gives 96, 100, 104, 108 for lanes 0..3, which is
+  `c + (c^16) + (c^32) + (c^48)` exactly.
+- it is still correct when preceded by a reduction loop with a lane-varying
+  lower bound, which was the obvious suspect.
+- it is wrong in the kernel even when the combine is left summing every slot
+  and scaling, which is the shape that is right whether or not the butterfly
+  ran. So it is the butterfly, not the indexing around it.
+- `gpu.shuffle xor` with offset 32 across 8 waves is fine on its own
+  (thread 64 gets 64+96=160).
+
+Every working use of `gpu.shuffle` in this generator sits inside
+`scf.if %isW0`; this one does not. That is the remaining difference and it is
+not yet chased. Worth roughly 20-30% when it is.
+
+### What is left, in the order the measurements rank it
+
+1. **Cross-workgroup K-split** -- Fleet's `gang_ksplit_linear_mi300.cuh`:
+   partial GEMM into an f32 workspace by atomicAdd, then a finalize task. It is
+   the only change that gives all three things at once: more workgroups (128 of
+   304 CUs are reached now), bigger per-thread pieces (32 MACs is far too fine)
+   and a cheaper combine (`klanes` falls as the slice widens).
+2. **Vector loads.** 27% of the body is weight loads and each fetches one
+   element. A `vector<8xbf16>` load fetches eight. Needs either wider slices or
+   the ColumnMajor-B layout CK uses, so it follows (1).
+3. **MFMA.** Still 0. Worth doing after the loads, not before: at 1.8% of
+   bandwidth an instruction that does 8192 MACs has nothing to eat.
 
 ### Measuring this at all -- 100 launches, not 3, and not 9
 

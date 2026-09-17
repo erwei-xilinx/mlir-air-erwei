@@ -65,10 +65,17 @@ t() {
   echo "--- REPEAT=$r, others on node: $(squeue -w "$(hostname)" -h -o '%i:%u' | tr '\n' ' ')" >&2
   s=$(date +%s.%N)
   if ! REPEAT="$r" TMPDIR="/tmp/air_bench_$$_$r" "$RUNDIR/run_qwen.sh" > "$out" 2>&1; then
-    echo "FAIL: run_qwen.sh returned nonzero, see $out" >&2; tail -20 "$out" >&2; exit 1
+    if [ -z "${DIAG:-}" ]; then
+      echo "FAIL: run_qwen.sh returned nonzero, see $out" >&2; tail -20 "$out" >&2; exit 1
+    fi
   fi
   e=$(date +%s.%N)
-  grep -q '^PASS' "$out" || { echo "FAIL: no PASS line in $out" >&2; tail -20 "$out" >&2; exit 1; }
+  # DIAG=1 is for deliberately-incorrect builds used to attribute cost. It
+  # skips the PASS requirement, so never use it to time something you intend
+  # to keep.
+  if [ -z "${DIAG:-}" ]; then
+    grep -q '^PASS' "$out" || { echo "FAIL: no PASS line in $out" >&2; tail -20 "$out" >&2; exit 1; }
+  fi
   echo "$e $s" | awk '{printf "%.3f\n", $1-$2}'
 }
 
