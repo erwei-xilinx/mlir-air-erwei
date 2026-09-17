@@ -76,6 +76,24 @@ capability**: at M=1 a `32x32` warp tile wastes 31 of its 32 output rows, while
 Fleet's `16x16` wastes 15 of 16. Choosing the tile for decode is a tuning
 question to answer with measurements, not a precondition to clear.
 
+## Going through MLIR costs nothing in code quality
+
+The linked kernel's assembly, for the probe above:
+
+```
+buffer_load_dwordx4        15     <- the only load form emitted
+v_mfma_f32_32x32x8_bf16    24     <- matches the 32x32x8 warp tile
+```
+
+`buffer_load_dwordx4` is 1024 bytes per wave instruction; the megakernel's
+hand-written loop emits `global_load_ushort`, 128 bytes. There is no scalar
+fallback and no degraded form -- the bitcode is linked before codegen, so CK is
+inlined and optimised with the MLIR kernel exactly as hipcc would have done it.
+Fleet's own megakernel has the same `buffer_load_dwordx4` among its loads.
+
+So whatever the AIR-vs-Fleet gap is, **it is not a penalty for reaching CK
+through MLIR**.
+
 ## Four things that bite, in the order they bit
 
 1. **`func.func private` is the wrong declaration.** It gets an
