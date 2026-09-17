@@ -1806,9 +1806,23 @@ module {{
     # counter rather than a global tile id, because that counter is what a
     # die's workgroups share. At tokens == 1 this is m = 0, n = k.
     def strided_stage(l, stage, ev, count_expr, total_const, body,
-                      slot=None, lc=None, lanes=False):
+                      slot=None, lc=None, lanes=False, count_n=None):
         slot = (l * stages + stage) if slot is None else slot
         lc = f"%L{l}" if lc is None else lc
+        # How many pieces a die owns before it starts stealing. The pieces a
+        # die owns are contiguous, which is the whole point: a piece is a slice
+        # of output columns, so contiguous pieces are contiguous columns, and
+        # at 128 tasks over a 1024-wide output that is 8 columns a piece and 64
+        # a die -- exactly the 64 bf16 in one 128-byte line.
+        #
+        # Handing the dies a *stride* of pieces instead, which is what this did,
+        # gives every die a different eighth of the same line: sixteen dies all
+        # fetch line 0 of every row of the weight matrix and each uses an eighth
+        # of it. The comment that stride was written under -- "what a die
+        # touches is what its cache already holds" -- describes the blocked
+        # mapping, not the strided one.
+        count_n = tasks if count_n is None else count_n
+        per_die = (count_n + maxdies - 1) // maxdies
         # How much of the workgroup the body uses.
         #   False  -- the lead thread alone; the body is a reduction or an
         #             in-place update that has not been spread yet.
@@ -1878,9 +1892,15 @@ module {{
               }}
               %m = arith.addi %mkn#0, %c0_s : index
               %kn = arith.addi %mkn#1, %c0_s : index
-              %kstride = arith.muli %kn, %cmaxdies : index
-              %ix = arith.addi %d, %kstride : index
-              %has = arith.cmpi ult, %ix, {count_expr} : index
+              %cpd{l}_{stage} = arith.constant {per_die} : index
+              %dbase = arith.muli %d, %cpd{l}_{stage} : index
+              %ix = arith.addi %dbase, %kn : index
+              // Two bounds, not one: the die stops at the end of its own block
+              // as well as at the end of the grid. Without the first, die 0
+              // would run off into die 1's pieces and both would compute them.
+              %inblk = arith.cmpi ult, %kn, %cpd{l}_{stage} : index
+              %inall = arith.cmpi ult, %ix, {count_expr} : index
+              %has = arith.andi %inblk, %inall : i1
               %acc2 = scf.if %has -> i32 {{
 {open_body}
 {body}
@@ -2276,7 +2296,7 @@ module {{
                     %vv = memref.load %sqkv[%m, %vi] : {QT}
                     memref.store %vv, %svc[%L{l}, %pos, %ix, %hdi] : {KVT}
                   }}
-                }}""", lanes=True))
+                }}""", lanes=True, count_n=heads))
 
         # 3: attention for one (token, query head). Scores, softmax and the
         # weighted sum of V in one task, which is how Fleet packages it
@@ -2373,7 +2393,7 @@ module {{
                   }}
                   %oi = arith.addi %hb, %hdi : index
                   memref.store %a, %sav[%m, %oi] : {QWT}
-                }}""", lanes="block"))
+                }}""", lanes="block", count_n=heads))
 
         # 4: ao = a @ Wo
         w(matmul_stage(l, 4, base + 4, "%saov", AT, "%sav", QWT, "%swo", WTB,
