@@ -600,17 +600,19 @@ flush; that is the version to measure. Not yet done.
 
 **CORRECTED 2026-09-18. The figures below that came from summing the
 per-operator timer are lower bounds, and the true one is about 5.5 ms/token.**
-See "The instrument accounts for 59% of the program" for how that was found.
-Two instruments now agree on it: the in-kernel clock across the whole worker
-body says 32.8 ms a launch, and `bench.sh` at HI=4000 says 33.9, against a
-per-operator sum of 19.3.
+Three instruments agree on it: the in-kernel clock across the whole worker body
+says 32.8 ms a launch, `bench.sh` at HI=4000 says 33.9, and the per-operator
+table -- once its windows were made to close -- says 32.7. Before that the
+table said 19.3, and "The instrument accounted for 59% of the program" is how
+the other 41% was found and what it turned out to be.
 
 | | ms/token | x Fleet | x the memory floor |
 |---|--:|--:|--:|
 | memory floor | 0.14 | 0.06x | 1x |
 | **Fleet mirage_mpk** | **2.452** | 1x | 18x |
 | **AIR now, whole launch** | **~5.5** | **~2.24x** | **39x** |
-| AIR now, sum of the operators | 3.20 | 1.30x | 23x |
+| AIR now, sum of the operators, windows closed | 5.44 | 2.22x | 39x |
+| AIR now, sum of the operators, as first measured | 3.20 | 1.30x | 23x |
 | AIR at the start of the day, end to end | ~8.9 | 3.6x | 64x |
 | torch eager | 10.42 | 4.3x | 75x |
 
@@ -892,7 +894,7 @@ spread). Attention's body is not what sets that stage's duration: workgroup 0
 computes one of sixteen heads and then waits for the other fifteen either way.
 Kept for the operator, not claimed for the model.
 
-### The instrument accounts for 59% of the program
+### The instrument accounted for 59% of the program
 
 Everything in this file was ranked with the in-kernel `s_memrealtime` counters,
 so it matters a great deal that they sum to 1 928 424 ticks on a launch that
@@ -916,11 +918,30 @@ reads and emits none of the 69 per-stage ones:
 | without them | 3 254 368 | 3 259 220 | 3 259 644 |
 
 **0.8%.** The clock reads are nearly free, and the windows they define simply
-do not cover the stage. `llvm.amdgcn.s.memrealtime` has side effects, but the
-arithmetic around it does not, so the reads get scheduled away from the
-boundaries they were meant to mark. Between one stage's last read and the next
-stage's first there is, in the emitted IR, nothing but the timer's own
-accumulate -- and that accumulate is the 0.8%.
+do not cover the stage. Between one stage's last read and the next stage's
+first there is, in the emitted IR, nothing but the timer's own accumulate --
+and that accumulate is the 0.8%. So the reads are not where the IR puts them.
+
+**Only one of the two edges was anchored.** A stage's end read sits directly
+after its `gpu.barrier` and `llvm.fence`, and the backend will not schedule
+across those. Its start read, at the top of the next stage, has address
+arithmetic on both sides and nothing to hold it, so it sinks into the body it
+was meant to be timing. Every stage was measured from part-way through itself,
+and the part before the read was attributed to nobody.
+
+**The fix is to stop opening a second window.** Each stage now ends where the
+next one begins, on the read that was already anchored. The classes telescope:
+their sum is the last read minus the first, whatever the scheduler does with
+anything in between, so drift can only move time from one class to its
+neighbour. Measured, two runs of the same build, both PASS:
+
+| | coverage | instrument cost |
+|---|--:|--:|
+| two reads a stage | 58.8% | 0.8% |
+| one shared edge | **99.8%** (99.8% on the repeat) | 0.5% |
+
+No class moves more than 3.1% between the two runs, so the table can now be
+read class by class.
 
 Three other explanations were tried first and all came back negative, which is
 the only reason this one was looked for:
@@ -932,41 +953,69 @@ the only reason this one was looked for:
 The third is what pointed here. An instrument that gets 66% slower when its
 accumulator is moved to faster memory is not measuring what it claims to.
 
-**What this changes.** Absolute totals and shares are wrong -- every operator's
-"share" was a share of 59% of the program. Comparisons between two builds
-measured the same way are still the right way to rank, and the three
-predictions in this file that had an independent mechanism behind them (cache
-lines for the dim-wide matmuls, bytes-in-flight for the unroll, atomics for the
-queue) all came true. Report the launch clock or bench at HI>=4000 as the
-number; use the operator table to choose what to do next.
+**What this changes.** Every share quoted anywhere above this line was a share
+of 59% of the program, and every table taken before the fix under-reads each
+stage by the same ~8.7 us. Rankings between two builds measured the same way
+survive -- the three predictions in this file that had an independent mechanism
+behind them (cache lines for the dim-wide matmuls, bytes-in-flight for the
+unroll, atomics for the queue) all came true -- but no absolute number or share
+from an unchained table means anything.
 
-### What is left, on the operator table (a lower bound)
+### What is left
 
-| | body+wait | share |
-|---|--:|--:|
-| four layer matmuls | 1 068 952 | 56% |
-| attention | 174 128 | 9.1% |
-| lm head | 171 536 | 8.9% |
-| two rmsnorms | 171 276 | 8.9% |
-| rope+kv_append | 160 296 | 8.4% |
-| swiglu | 81 316 | 4.2% |
-| argmax partial | 79 072 | 4.1% |
+Chained table, 28 layers, 128 workers, 6 steps, run twice. `us/inst` is per
+stage instance: 168 of them a launch for a layer stage, 6 for an extra. The
+`floor` column is what the class gained when the windows were closed, which is
+the part of the stage that has nothing to do with what the stage computes.
 
-**There is a floor under all of this worth naming.** `final_norm` costs 3 020
-ticks for six instances and `argmax_reduce` 3 820 -- both trivial, both about
-**5 us per stage instance** whatever they do. At 257 stages a step that floor is
-roughly 1.3 ms of the 3.20, so a third of what is left is the cost of a stage
-existing rather than of anything it computes. Two consequences:
+| | body | wait | share | us/inst | floor us |
+|---|--:|--:|--:|--:|--:|
+| gate_up | 384 172 | 92 176 | 14.6% | 28.35 | 8.37 |
+| down | 410 328 | 52 168 | 14.1% | 27.53 | 9.06 |
+| o_proj | 343 584 | 40 084 | 11.7% | 22.84 | 9.35 |
+| qkv | 309 408 | 39 688 | 10.7% | 20.78 | 8.32 |
+| attention | 310 916 | 25 880 | 10.3% | 20.05 | 9.84 |
+| rope+kv_append | 288 636 | 18 292 | 9.4% | 18.27 | 8.71 |
+| rmsnorm.mlp | 217 004 | 12 096 | 7.0% | 13.64 | 8.62 |
+| rmsnorm.attn | 207 324 | 11 796 | 6.7% | 13.04 | 8.10 |
+| swiglu | 187 040 | 31 152 | 6.7% | 12.99 | 8.13 |
+| lm_head | 173 648 | 4 268 | 5.4% | 296.53 | 4.58 |
+| argmax_partial | 73 428 | 10 136 | 2.6% | 139.27 | 9.25 |
+| argmax_reduce | 8 392 | 416 | 0.3% | 14.68 | 8.20 |
+| final_norm | 7 420 | 428 | 0.2% | 13.08 | 8.27 |
+| embed | 4 012 | 1 200 | 0.2% | 8.69 | -0.48 |
+| **sum** | | | **99.8%** of 3 271 916 | | |
 
-* The two rmsnorms are 8.9% and one workgroup does each while 127 wait.
-  Splitting them across workgroups **cannot** pay: it would take two stages
-  where there is one, and two stage-floors cost more than the reduction does.
-  The only move that helps is removing the stage -- folding the sum of squares
-  into the matmul that produced the vector, and the normalisation into the
-  matmul that consumes it, so the rmsnorm is not a stage at all. Same for
-  swiglu, which Fleet fuses into gate_up.
+**The floor column is the finding.** It is the same number -- 8.1 to 9.8 us --
+for a 12.6 MB matmul and for a 4 KB normalisation, for a stage inside the layer
+loop and for one outside it. A stage costs about **8.7 us to exist**, and at
+257 stage instances a step that is **2.23 of the 5.46 ms a token takes, 41%**.
+
+This is the "per-stage floor" that was guessed at ~5 us from `final_norm` and
+`argmax_reduce` before the instrument was fixed, then withdrawn as an artefact
+of the missing 41%. It was not an artefact. It *was* the missing 41%, and it is
+75% larger than the guess. Two consequences:
+
+* The three small layer stages -- two rmsnorms and swiglu -- cost 13.0, 13.6
+  and 13.0 us each, of which 8.1 to 8.6 is the floor. They move 4 KB. Nothing
+  done *inside* them can matter. Splitting them across workgroups **cannot**
+  pay either: it would take two stages where there is one, and a second
+  stage-floor costs more than the whole reduction does.
+* The only move that helps is removing the boundary -- folding the sum of
+  squares into the matmul that produced the vector, the normalisation into the
+  matmul that consumes it, and swiglu into `down`, which is what Fleet does.
+  Three boundaries a layer at 8.7 us is 84 boundaries a step, 0.73 ms of the
+  5.46: **13% for fusions that change no arithmetic**, plus the 4-5 us of body
+  each of those stages spends on its own account.
 * Fewer, bigger stages beats better-balanced ones. Nine stages a layer could be
-  five or six.
+  five or six, and six would be worth about 2.2 ms/token on its own.
+
+**Before building any of that**, price the boundary with a second instrument.
+`--pad-stages N` adds N empty stages to every layer -- same claim, same signal,
+same rendezvous, no body, same six tokens out -- so the launch clock against N
+is a line whose slope is the cost of a boundary, with the per-stage timers
+switched off entirely. The chained table predicts 1.46 ms a pad on a 32.8 ms
+launch. A table cannot check itself.
 
 ### The number that reframes all of this
 
