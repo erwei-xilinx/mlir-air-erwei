@@ -602,18 +602,20 @@ flush; that is the version to measure. Not yet done.
 |---|--:|--:|--:|
 | memory floor | 0.14 | 0.06x | 1x |
 | **Fleet mirage_mpk** | **2.452** | 1x | 18x |
-| **AIR now** | **3.42** | **1.39x** | **24x** |
-| AIR after the reduction unroll | 5.5 | 2.25x | 39x |
-| AIR before it | 8.9 | 3.6x | 64x |
+| **AIR now** | **3.20** | **1.30x** | **23x** |
+| after the static claim | 3.42 | 1.39x | 24x |
+| after the reduction unroll | 5.5 | 2.25x | 39x |
+| before it | 8.9 | 3.6x | 64x |
 | torch eager | 10.42 | 4.3x | 75x |
 
-Three changes, in this order.
+Four changes, in this order.
 
 1. The claim-path fix cost 0.84% and bought correctness, not speed -- the 8.85
    that stood before it was a real number from a run that passed, but the
    program it measured had a live race that happened to win at 128 workers.
 2. `--reduce-unroll 8`: **1.61x**, bit-identical output. 3.6x -> 2.25x.
-3. The static claim: **1.60x**. 2.25x -> **1.39x**.
+3. The static claim: **1.60x**. 2.25x -> 1.39x.
+4. A per-stage piece count for the dim-wide matmuls: **1.06x**. -> **1.30x**.
 
 Both of the wins came from the same kind of place, and neither was visible in
 the operator ranking. The ranking says which operator is expensive; it does not
@@ -824,7 +826,87 @@ explicit.
 
 `attention` and `rope+kv_append` are now the largest things that are not
 matmuls, and they are the two with `heads` = 16 pieces to hand to 128
-workgroups. That is the next one.
+workgroups.
+
+### The piece count belongs to the stage, not to the model
+
+Re-running the task sweep now that a piece is cheap to get says three different
+things want three different counts. Bodies at 32/64/128/256:
+
+|  | 32 | 64 | 128 | 256 |
+|---|--:|--:|--:|--:|
+| gate_up | 761 036 | 464 392 | **246 988** | 297 740 |
+| qkv | 622 300 | 332 236 | **172 216** | 206 064 |
+| down | 416 168 | **242 288** | 281 456 | 322 164 |
+| o_proj | 283 160 | **175 468** | 184 324 | 257 108 |
+| lm_head | 600 372 | 310 400 | 168 628 | **118 664** |
+
+`o_proj` and `down` write a dim-wide output, so a piece at 128 is `dim/128` = 8
+columns. The lanes spread across those 8, which is **16 bytes of every 64-byte
+line**; the other 48 are fetched and discarded. They run at about 375 GB/s
+against gate_up and qkv at 830, and they want the slice wider even at the price
+of half the workgroups. Giving them `tasks/2`:
+
+| ticks, body+wait | before | after | |
+|---|--:|--:|---|
+| down | 384 916 | 303 300 | -21% |
+| o_proj | 255 876 | 223 316 | -13% |
+| **whole model** | **2 027 708** | **1 918 576** | **-5.4%** |
+
+**And the lm head row is a trap I walked into.** It says 256, so I gave the lm
+head 256 pieces, and it got 11% *worse* -- 171 236 ticks to 190 700. The sweep
+moves `tasks` and `workers` together, so that row measured 256 *workgroups*,
+not 256 pieces. The lm head is the one stage already at about 1.17 TB/s: what
+it wants is more of the machine, and two pieces of 594 columns instead of one
+of 1187 is the same bytes with one more loop around them. Reverted.
+
+The general form of that mistake is worth keeping: **a sweep that moves two
+knobs together cannot tell you which one the operator responded to**, and every
+row of this one moves both. The dim-wide rows survived because there is an
+independent mechanism -- cache lines -- that predicts them; the lm head row had
+none and was just read off.
+
+### Non-temporal on the kv cache: a wash, with a 10% operator underneath
+
+The kv cache reads were marked non-temporal. It is the one thing a decode step
+reads again, and the whole cache is about a megabyte over 28 layers, so it
+belongs in L2. The last loop of the attention body is a chain of `curlen`
+*dependent* loads of it, which made that `curlen` memory round trips end to
+end, per head, per layer, per step.
+
+Removing it takes the attention body from 168 516 ticks to 151 560, **10%** --
+and the model total does not move at all (2 036 876 to 2 042 044, inside the
+spread). Attention's body is not what sets that stage's duration: workgroup 0
+computes one of sixteen heads and then waits for the other fifteen either way.
+Kept for the operator, not claimed for the model.
+
+### What is left at 3.20 ms/token
+
+| | body+wait | share |
+|---|--:|--:|
+| four layer matmuls | 1 068 952 | 56% |
+| attention | 174 128 | 9.1% |
+| lm head | 171 536 | 8.9% |
+| two rmsnorms | 171 276 | 8.9% |
+| rope+kv_append | 160 296 | 8.4% |
+| swiglu | 81 316 | 4.2% |
+| argmax partial | 79 072 | 4.1% |
+
+**There is a floor under all of this worth naming.** `final_norm` costs 3 020
+ticks for six instances and `argmax_reduce` 3 820 -- both trivial, both about
+**5 us per stage instance** whatever they do. At 257 stages a step that floor is
+roughly 1.3 ms of the 3.20, so a third of what is left is the cost of a stage
+existing rather than of anything it computes. Two consequences:
+
+* The two rmsnorms are 8.9% and one workgroup does each while 127 wait.
+  Splitting them across workgroups **cannot** pay: it would take two stages
+  where there is one, and two stage-floors cost more than the reduction does.
+  The only move that helps is removing the stage -- folding the sum of squares
+  into the matmul that produced the vector, and the normalisation into the
+  matmul that consumes it, so the rmsnorm is not a stage at all. Same for
+  swiglu, which Fleet fuses into gate_up.
+* Fewer, bigger stages beats better-balanced ones. Nine stages a layer could be
+  five or six.
 
 ### The number that reframes all of this
 
