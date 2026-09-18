@@ -1010,12 +1010,70 @@ of the missing 41%. It was not an artefact. It *was* the missing 41%, and it is
 * Fewer, bigger stages beats better-balanced ones. Nine stages a layer could be
   five or six, and six would be worth about 2.2 ms/token on its own.
 
-**Before building any of that**, price the boundary with a second instrument.
-`--pad-stages N` adds N empty stages to every layer -- same claim, same signal,
-same rendezvous, no body, same six tokens out -- so the launch clock against N
-is a line whose slope is the cost of a boundary, with the per-stage timers
-switched off entirely. The chained table predicts 1.46 ms a pad on a 32.8 ms
-launch. A table cannot check itself.
+### A stage boundary costs 12.40 us, measured without the timers
+
+`--pad-stages N` adds N empty stages to every layer: same claim, same signal,
+same rendezvous, no body. They produce 12095,13,576,6722,315,15344 like
+everything else, so the launch clock against N is a line whose slope is what a
+boundary costs -- with the per-stage timers switched off entirely, which is the
+point. A table cannot check itself.
+
+28 layers, 128 workers, 6 steps, REPEAT=20, whole-launch ticks:
+
+| pads | ticks | stage instances a step |
+|--:|--:|--:|
+| 0 | 3 255 560 | 257 |
+| 1 | 3 471 628 | 285 |
+| 2 | 3 671 436 | 313 |
+| 3 | 3 883 536 | 341 |
+
+`launch = 3 257 980 + 208 374 x pads`, residuals -2419, +5274, -3290, +435 --
+**0.15%**. A pad is 168 stage instances a launch, so a stage boundary is
+**12.40 us**, and 257 of them a step is **3.19 of the 5.43 ms a token takes**.
+
+That is larger than the chained table's 8.7 us and both are right: the table
+only ever recovered the half of the boundary its windows had been missing, the
+part between the previous stage's fence and this stage's first load. The
+release, the atomics and the spin were already inside the old window, charged
+to the stage, and invisible as overhead. 12.40 is the whole thing.
+
+**What this means for the gap.** If the boundary is 3.19 ms/token then the work
+-- every load of every weight, every FMA, the attention, the argmax -- is
+2.24 ms/token, and Fleet's *entire* time for the same model is 2.452. AIR's
+arithmetic and memory traffic are already at Fleet's level. The gap to Fleet,
+all of it and then some, is the cost of the way stages meet.
+
+Two levers, and they are independent:
+
+* **Fewer boundaries.** Each stage removed from a layer is 208 374 ticks a
+  launch, **0.35 ms/token**. Folding swiglu into gate_up (pair the gate and up
+  column slices in the same piece and it costs no extra traffic at all, which
+  is what Fleet does), and the two rmsnorms into their neighbours, is 9 stages
+  a layer down to 6: **1.04 ms/token**, before counting the bodies that stop
+  being separate stages.
+* **A cheaper boundary.** 12.40 us is ~26 000 cycles for four atomics, two
+  barriers, a `buffer_inv sc0 sc1` and a spin. If it can be brought to 3 us
+  that is 2.4 ms/token, larger than every fusion together. `--pad-strip`
+  measures which piece it is: a pad stage publishes nothing and nothing waits
+  on its event, so pieces can be removed from one and the tokens stay right.
+
+### The launch clock is bimodal, and it is all in gate_up
+
+About a third of launches come in **1.15 M ticks (11.5 ms, 35%) slow**. Eight
+single launches, all PASS: seven at 3.276 to 3.290 M, agreeing to 0.4%, and one
+at 4.421 M. With the windows closed the table can say where it went, and the
+answer is one class:
+
+| | fastest launch | slow launch | delta |
+|---|--:|--:|--:|
+| gate_up body | 386 488 | 1 515 631 | **+1 129 143** |
+| every other class | | | under 20 000 |
+
+gate_up reads the largest weight matrix in the layer, 12.6 MB, and in the slow
+mode workgroup 0 spends 3.9x as long in it while nothing else moves. Not
+diagnosed. Until it is, take the **minimum** of repeated launches, not the
+mean: the fast mode is the program and the slow mode is something on top of
+it. Not yet known whether it correlates with another job on the node.
 
 ### The number that reframes all of this
 
