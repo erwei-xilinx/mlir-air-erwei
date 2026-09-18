@@ -596,6 +596,134 @@ workgroup-scope fence should emit the `s_waitcnt vmcnt(0)` without the
 writeback, and the lead thread's system-scope release already does the L2
 flush; that is the version to measure. Not yet done.
 
+### Where the gap against Fleet stands, 2026-09-18
+
+| | ms/token | x Fleet | x the memory floor |
+|---|--:|--:|--:|
+| memory floor | 0.14 | 0.06x | 1x |
+| **Fleet mirage_mpk** | **2.452** | 1x | 18x |
+| **AIR now** | **~5.5** | **2.25x** | **39x** |
+| AIR before the reduction unroll | 8.9 | 3.6x | 64x |
+| torch eager | 10.42 | 4.3x | 75x |
+
+Two changes, in this order. The claim-path fix cost 0.84% and bought
+correctness, not speed -- the 8.85 that stood before it was a real number from
+a run that passed, but the program it measured had a live race that happened to
+win at 128 workers. Then `--reduce-unroll 8` took 1.61x off the whole model
+with bit-identical output, which is what moved 3.6x to 2.25x.
+
+The 8.9 is the timer sum, not a fresh `bench.sh`: 5 413 164 ticks at 100 MHz is
+54.1 ms for six steps, 9.0 ms a step, which agrees with the 8.85 `bench.sh`
+measured to well within that instrument's +/- 1.7. There is no point running
+`bench.sh` to resolve a 0.84% change.
+
+**Where the 3.6x lives.** Ticks at 128/128, 28 layers, 6 steps, out of
+5 413 164:
+
+| | body | wait | share |
+|---|--:|--:|--:|
+| **four layer matmuls** | 3 834 108 | 392 048 | **78%** |
+| swiglu | 236 052 | 44 168 | 5.2% |
+| attention | 128 292 | 127 484 | 4.7% |
+| rope+kv_append | 126 304 | 91 220 | 4.0% |
+| two rmsnorms | 59 264 | 134 740 | 3.6% |
+| lm head + argmax | 213 880 | 9 816 | 4.1% |
+
+So the small stages are 17.5% all told. **Even deleting every one of them
+outright leaves 7.3 ms/token, still 3x Fleet.** The matmuls are the gap and
+everything else is rounding.
+
+### What the matmuls are actually doing, in cycles
+
+gate_up reads 1024 x 6144 bf16 per layer. At 128 tasks a workgroup's piece is
+48 columns, its 512 threads split 32 ways across columns and 16 ways across the
+reduction, so **a thread loads 96 weights a layer, 2688 over the 28**. That
+takes 2.13 ms/token, which at ~2.1 GHz is 4.47M cycles, or
+
+    1660 cycles per weight, against 14 instructions of work
+
+Two waves share a SIMD, so call it 830 cycles a weight per wave slot. **That is
+one full memory latency per loop iteration, overlapped with nothing.** The loop
+asks for one weight, waits for it, multiplies, and asks for the next.
+
+Little's law says the same thing from the other side. A wave has 128 bytes
+outstanding -- 64 lanes x 2 bytes, two half-wave cache lines -- and 1024 waves
+gives 131 KB in flight device-wide. Holding 8 TB/s open across a ~1 us latency
+needs about 8 MB. We are 60x short, and the achieved 165 GB/s on gate_up is
+2% of peak, which is the same 60x.
+
+Fleet's inner loop, from its ISA: 40 `buffer_load_dwordx4` per iteration with
+20 outstanding, **20 480 bytes in flight per wave against our 128**.
+
+That is the whole difference, and it is not a workgroup-count problem -- 256
+workers made the total worse and 512 does not fit. It is bytes in flight per
+wave. `--reduce-unroll` is the first lever at it: issue N weight loads before
+waiting on the first. The accumulate chain is untouched, so the result is bit
+for bit identical and any difference in the output is a bug.
+
+An earlier note recorded "unrolling does nothing, 8.857 -> 8.807". That was
+read off `bench.sh` at +/- 1.7 ms/token resolution, which is the instrument
+that has now mis-ranked five separate things. Re-measured per operator, it does
+rather a lot.
+
+### Unrolling the reduction: 1.61x, bit for bit
+
+Device ticks at 128/128, 28 layers, 6 steps. Every row printed
+`total differences = 0`, which is the point of keeping the accumulate a single
+chain in the original order -- the unrolled loop is not an approximation of the
+rolled one, it is the same sum.
+
+| ticks | u=1 | u=2 | u=4 | **u=8** | u=16 |
+|---|--:|--:|--:|--:|--:|
+| gate_up | 1 295 212 | 1 024 016 | 659 812 | **523 452** | 1 258 980 |
+| qkv | 997 092 | 706 276 | 521 388 | **429 936** | 966 232 |
+| down | 898 004 | 652 004 | 509 536 | **497 552** | 887 676 |
+| o_proj | 702 868 | 529 124 | 433 176 | **417 876** | 691 428 |
+| **whole model** | **5 413 164** | | | **3 358 532** | 5 404 172 |
+
+**1.61x on the whole model, 2.47x on gate_up.** In ms/token that is about 8.9
+to **5.5**, and the gap against Fleet goes **3.6x to 2.25x**.
+
+16 gives it all back and lands on 1's numbers: sixteen weights and sixteen
+activations in flight is more registers than the wave has, so the loads stop
+being issued back to back. 8 is the knee.
+
+This is the lever the cycle arithmetic pointed at and it moved almost exactly
+as predicted. The loop was paying one memory latency per iteration; issuing
+eight loads before the first `s_waitcnt` pays one latency per eight.
+
+### What is left after it
+
+At u=8 the shape of the problem has changed -- the matmuls are 63% rather than
+78%, and the small stages are a third of the time:
+
+| | body+wait | share |
+|---|--:|--:|
+| four layer matmuls | 2 127 712 | 63% |
+| swiglu | 292 348 | 8.7% |
+| attention | 263 004 | 7.8% |
+| rope+kv_append | 226 088 | 6.7% |
+| two rmsnorms | 209 904 | 6.3% |
+| lm head | 161 012 | 4.8% |
+
+Three things worth doing next, in order of how well the measurement supports
+them:
+
+1. **lm\_head did not move** (159 932 -> 158 516): it has its own reduction
+   loop in `strided_stage`, not `matmul_stage`, and `dot_loop` was never wired
+   into it. Its weight is indexed `[v][i]` with `i` fastest, so a lane reads
+   contiguously rather than across lanes -- a different pattern, worth its own
+   measurement. 4.8%.
+2. **swiglu is not compute, it is a rendezvous.** It is elementwise over 3072
+   values with 65 536 threads available, so its 8.7% is almost entirely the
+   stage existing. Fleet fuses SiLU into gate\_up (`USE_FUSED_SILU=1`). Doing
+   the same means slicing the 6144-wide gate/up output by the *pair* index so
+   one piece holds both `gate[j]` and `up[j]`, and the stage disappears.
+3. **attention and rope have `heads` = 16 pieces** however many workgroups
+   exist, so 112 of 128 workgroups sit at the rendezvous. Splitting attention
+   by (head, key block) with a flash-style combine is the real fix and the
+   largest piece of work of the three.
+
 ### The number that reframes all of this
 
 At batch one every weight is read exactly once per token. Qwen3-0.6B is ~553M
