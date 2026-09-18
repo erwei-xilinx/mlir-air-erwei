@@ -598,15 +598,27 @@ flush; that is the version to measure. Not yet done.
 
 ### Where the gap against Fleet stands, 2026-09-18
 
+**CORRECTED 2026-09-18. The figures below that came from summing the
+per-operator timer are lower bounds, and the true one is about 5.5 ms/token.**
+See "The instrument accounts for 59% of the program" for how that was found.
+Two instruments now agree on it: the in-kernel clock across the whole worker
+body says 32.8 ms a launch, and `bench.sh` at HI=4000 says 33.9, against a
+per-operator sum of 19.3.
+
 | | ms/token | x Fleet | x the memory floor |
 |---|--:|--:|--:|
 | memory floor | 0.14 | 0.06x | 1x |
 | **Fleet mirage_mpk** | **2.452** | 1x | 18x |
-| **AIR now** | **3.20** | **1.30x** | **23x** |
-| after the static claim | 3.42 | 1.39x | 24x |
-| after the reduction unroll | 5.5 | 2.25x | 39x |
-| before it | 8.9 | 3.6x | 64x |
+| **AIR now, whole launch** | **~5.5** | **~2.24x** | **39x** |
+| AIR now, sum of the operators | 3.20 | 1.30x | 23x |
+| AIR at the start of the day, end to end | ~8.9 | 3.6x | 64x |
 | torch eager | 10.42 | 4.3x | 75x |
+
+So the day is about **8.9 -> 5.5 ms/token, 1.6x**, not the 2.8x the operator
+sums imply. The operator tables are still the right instrument for *ranking*
+two builds -- every prediction made from them that had an independent mechanism
+behind it came true -- but their absolute totals are not the program and must
+not be reported as it.
 
 Four changes, in this order.
 
@@ -880,7 +892,55 @@ spread). Attention's body is not what sets that stage's duration: workgroup 0
 computes one of sixteen heads and then waits for the other fifteen either way.
 Kept for the operator, not claimed for the model.
 
-### What is left at 3.20 ms/token
+### The instrument accounts for 59% of the program
+
+Everything in this file was ranked with the in-kernel `s_memrealtime` counters,
+so it matters a great deal that they sum to 1 928 424 ticks on a launch that
+takes 3 277 428.
+
+The launch figure comes from two more clock reads bracketing the worker body,
+and `bench.sh` independently agrees with it: **33.9 ms a launch against the
+in-kernel 32.8**, once it is run at a repeat count where it can resolve
+anything. It has been run at HI=100 throughout, which is 1.9 s of kernel
+against a 60 s fixed cost that wanders +/- 3 s -- that is the whole story of
+its +/- 1.7 ms/token and of the five things it mis-ranked. At HI=4000 it is
+76 s of kernel against the same +/- 3 s. Its own repeatability there is still
++/- 0.3 ms/token: measured, by running the same build twice (5.6 and 5.9).
+
+**The gap is not the instrument.** `--timers-total-only` keeps the two launch
+reads and emits none of the 69 per-stage ones:
+
+| WHOLE LAUNCH ticks | run 1 | run 2 | run 3 |
+|---|--:|--:|--:|
+| with the per-stage timers | 3 284 100 | 3 983 109 | 3 286 892 |
+| without them | 3 254 368 | 3 259 220 | 3 259 644 |
+
+**0.8%.** The clock reads are nearly free, and the windows they define simply
+do not cover the stage. `llvm.amdgcn.s.memrealtime` has side effects, but the
+arithmetic around it does not, so the reads get scheduled away from the
+boundaries they were meant to mark. Between one stage's last read and the next
+stage's first there is, in the emitted IR, nothing but the timer's own
+accumulate -- and that accumulate is the 0.8%.
+
+Three other explanations were tried first and all came back negative, which is
+the only reason this one was looked for:
+
+* the event protocol at **agent scope** instead of system: a wash;
+* **one acquire fence per workgroup** instead of one per wave: 2.6% *worse*;
+* the counters **in LDS** instead of global memory: 66% *worse*.
+
+The third is what pointed here. An instrument that gets 66% slower when its
+accumulator is moved to faster memory is not measuring what it claims to.
+
+**What this changes.** Absolute totals and shares are wrong -- every operator's
+"share" was a share of 59% of the program. Comparisons between two builds
+measured the same way are still the right way to rank, and the three
+predictions in this file that had an independent mechanism behind them (cache
+lines for the dim-wide matmuls, bytes-in-flight for the unroll, atomics for the
+queue) all came true. Report the launch clock or bench at HI>=4000 as the
+number; use the operator table to choose what to do next.
+
+### What is left, on the operator table (a lower bound)
 
 | | body+wait | share |
 |---|--:|--:|
