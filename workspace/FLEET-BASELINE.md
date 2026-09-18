@@ -404,13 +404,12 @@ Use `--timers` to rank a change. Use `bench.sh` only to confirm a large one.
 `tasks` is how many pieces a stage splits into, and `workers` the workgroups.
 Measured per operator, all at 8 waves:
 
-| ms/token | 32 | 64 | 128 | 256 |
-|---|--:|--:|--:|--:|
-| total | 21.52 | 12.72 | **8.87** | 11.06 |
-| gate_up | 7.33 | 4.08 | 2.41 | **2.03** |
-| qkv | 5.04 | 2.65 | 1.72 | **1.57** |
-| o_proj | 2.64 | 1.64 | **1.21** | 1.36 |
-| rmsnorm.mlp | 0.17 | 0.18 | **0.18** | **2.03** |
+| ms/token | 32 | 64 | 128 |
+|---|--:|--:|--:|
+| total | 21.52 | 12.72 | **8.87** |
+| gate_up | 7.33 | 4.08 | 2.41 |
+| qkv | 5.04 | 2.65 | 1.72 |
+| o_proj | 2.64 | 1.64 | **1.21** |
 
 **The four layer matmuls are bound by how many workgroups there are and by
 nothing else.** In particular not by cache-line utilisation, which varies the
@@ -418,15 +417,184 @@ other way: a piece is `width/tasks` columns and the lanes spread across them,
 so o_proj uses 16 bytes of every 128-byte line at 128 tasks and 64 bytes at 32
 -- and 128 is twice as fast. That kills the "widen the slice" idea outright.
 
-It stops at 128 because of the other half. At 256 the matmuls keep improving
-and everything else gets worse, and the mechanism is visible in one row:
-**`single_stage` is a serialisation point.** One workgroup computes an rmsnorm
-while the rest wait at the rendezvous, and that wait grows with the worker
-count -- rmsnorm.mlp goes 0.18 to 2.03. So the only lever that still works on
-the matmuls is capped by the stages that are not matmuls.
+**A 256 column stood here and it has been withdrawn. It was read off a run
+that printed `FAIL: total differences = 150878` in the same output as the
+numbers.** There is no reading to defend: a program that computed the wrong
+logits is not a measurement of how long it takes to compute the right ones.
+The conclusion drawn from it -- "`single_stage` is the serialisation point,
+`rmsnorm.mlp` goes 0.18 to 2.03, so the rendezvous is what caps the worker
+count" -- was drawn from a broken program and does not survive it. What was
+actually wrong is below.
 
-The vocabulary no longer forbids going past 128 (151936 = 2^7 * 1187 used to
-cap it); the rendezvous does.
+The rule this breaks is the one in "Measuring this at all": a number is not a
+measurement until the run that produced it says PASS. `run_qwen.sh` prints that
+line; the sweep script grepped for `body|wait|PASS|FAIL` and the FAIL went into
+the log where it was not read. Grep for the verdict *first*, or do not record
+the row.
+
+### What was actually wrong: a workgroup-divergent barrier
+
+Bisected on MI350X, 8 waves, one step, `run_qwen.sh` against the independent
+numpy reference. Each cell is that configuration's `total differences`:
+
+| tasks | workers | 1 layer | 28 layers |
+|--:|--:|---|---|
+| 128 | 128 | pass | pass |
+| 256 | 128 | pass | pass |
+| 512 | 128 | pass | **pass** |
+| 128 | 256 | pass | **FAIL** 318k / 758k |
+| 256 | 256 | pass | **FAIL** 697k / 757k / 693k |
+| 512 | 512 | hangs | -- |
+
+Read it in this order:
+
+* **The slicing is innocent.** 512 pieces over 128 workgroups is right for 28
+  layers. Every failure has 256 workgroups and the piece count does not matter.
+* **The arithmetic is innocent.** 256/128 and 256/256 split the reduction
+  identically, so they sum in the same order; one is exact and the other is
+  not.
+* **It is a race, not a logic bug.** The same configuration twice gives 697k
+  and 757k differences. And it needs depth -- 2 and 4 layers pass, 8 fails --
+  which is what "needs enough trials" looks like.
+* **The scheduler's accounting is intact even when the answer is wrong.**
+  `device-scope event flushes = 1592` in the failing runs, which is exactly
+  199 stages x 8 dies. Every piece was claimed exactly once. They were
+  *computed* wrong.
+
+The cause is the drained-queue flag, the -1.70 ms win of `378fa02e`. Its
+comment read:
+
+> Uniform load: every thread reads the same word and gets the same answer
+
+Every thread reads the same *address*. It does not get the same answer: another
+workgroup is setting that word from 0 to 1 while this one reads it, so two
+waves can land either side of the write. And the branch they then disagree on
+contains the claim broadcast -- which past one wave is LDS and **two
+`gpu.barrier`s**. So the waves of one workgroup met different barriers, and the
+claim a wave read out of LDS was some other wave's. The piece is still counted
+exactly once, which is why the flush total stayed perfect while the values went
+wrong.
+
+Proof, not inference: pinning `%drained` to false and changing nothing else
+turned 256/256 at 28 layers from three failures out of three into three passes
+out of three, and 128/256 with it.
+
+**The general shape of this, worth keeping:** in a workgroup wider than one
+wave, a value another workgroup can write concurrently is not workgroup-uniform
+no matter how uniform its address is, and branching on one around a barrier is
+a bug even when every thread is reading the same location. Anything read from
+the scheduler's shared state has to be read by one thread and broadcast, or not
+branched on.
+
+### The fix: the search for a piece belongs to one thread
+
+The flag was worth 1.70 ms and the fix keeps it. What changed is who is allowed
+to look at it. `strided_stage` used to be a loop over the dies with a claim loop
+inside it, and the flag test sat in the outer loop where every thread evaluated
+it. Now there is one loop, and the whole search -- the flag reads, the atomics,
+the "this queue is empty now" store -- happens inside `scf.if %isLead`. What
+comes out is one broadcast of two numbers, the queue and the piece, and a
+sentinel piece index when the scan found nothing so that every wave reaches the
+same out-of-range test on the same path.
+
+Nothing outside the lead thread reads a flag, so nothing outside it can branch
+on one, so no two waves can meet different barriers. It is uniform by
+construction rather than by an argument about addresses.
+
+It also broadcasts less. Before, every die probe that came up empty cost a
+claim, a broadcast and two barriers to discover it; now the whole scan is one
+broadcast, so a workgroup pays one per piece it actually gets plus one to find
+out there are none left, instead of one per die it looks at.
+
+### What 256 workers actually does, now that it computes the right answer
+
+Per operator, 28 layers, 6 steps, device ticks at 100 MHz. Both columns PASS.
+
+| ticks | 128/128 | 256/256 | |
+|---|--:|--:|---|
+| **total** | **5 413 164** | 5 825 788 | **+7.6% worse** |
+| gate_up | 1 275 640 | 1 100 076 | -13.8% |
+| qkv | 978 104 | 896 044 | -8.4% |
+| lm_head | 159 072 | 113 240 | -29% |
+| down | 885 772 | 887 188 | flat |
+| o_proj | 694 592 | 747 784 | +7.7% |
+| swiglu | 236 052 | 547 052 | **+132%** |
+| rope+kv_append | 126 304 | 240 040 | **+90%** |
+| attention | 128 292 | 239 460 | **+87%** |
+| rmsnorm.attn body | 29 888 | 60 120 | +101% |
+| rmsnorm.mlp *wait* | 71 756 | 63 564 | **-11%** |
+
+512 workers does not run at all: 512 workgroups of 8 waves is 4096 waves, more
+than the part holds, and a persistent megakernel whose workgroups are not all
+resident hangs rather than running slowly. So 256 is the top of this axis.
+
+**The rendezvous is not what caps the worker count.** The rmsnorm waits get
+*shorter* at 256, not longer. What the withdrawn table read as "`single_stage`
+serialises" was the broken program.
+
+What actually stops it is the opposite of a serialisation point -- it is the
+stages that have nothing like enough pieces to go round:
+
+* **`attention` and `rope+kv_append` split by head, so they have `heads` = 16
+  pieces however many workgroups there are.** At 128 workers 112 workgroups
+  already have nothing to do but probe eight queues and wait; at 256 it is 240.
+  That is the whole +90%.
+* **`swiglu` gives each piece `inter/tasks` columns and each workgroup 512
+  threads**: 24 columns at 128 tasks, 12 at 256. So 24 of 512 threads work and
+  488 stride past the end, and halving the piece halves the occupancy again.
+* The small bodies also double because two workgroups now share a CU, so
+  latency-bound work gets half the issue slots.
+
+Those four stages are **10% of the time in their bodies and 7% more in their
+waits** at the shipping config, and essentially all of it is thread and piece
+mapping rather than memory. That is the next target, and it is a more ordinary
+piece of work than chasing the 64x to the memory floor: split attention by
+(head, key block) so it has pieces to give out, and give swiglu a piece worth
+512 threads.
+
+### Running two of these at once: the generator is shared mutable state
+
+`run_qwen.sh` and `run.sh` resolve the generator as `$SCRIPT_DIR/gen.py`, and
+the established way to test a variant is to copy it over that file. Two jobs
+doing that in the same tree edit each other's program: a second job started
+here swapped its variant in seven minutes into the first one's run, and
+everything the first job measured after that timestamp was measuring the other
+job's generator. It was caught by the file timestamp, not by any result looking
+wrong -- which is the problem with it.
+
+Every job that swaps generators now copies the whole `megakernel_gen`
+directory into its own run directory first and runs from there. Copying only
+`gen.py` is not enough; `run_qwen.sh` also resolves `weights_loader.c`,
+`weights.py` and `qwen3_ref.py` relative to itself.
+
+### The other thing the ISA says: the rendezvous is asymmetric
+
+Not the cause of the above, but real and still open. The consumer side of every
+rendezvous ends:
+
+    gpu.barrier
+    llvm.fence syncscope("") acquire      // every thread
+
+and the producer side is:
+
+    gpu.barrier                           // and nothing else
+    scf.if %isLead { atomicrmw ... release }
+
+`gpu.barrier` is `s_barrier`. In the emitted ISA every one of them is preceded
+by at most `s_waitcnt lgkmcnt(0)` and most carry no `s_waitcnt` at all; none
+carries `vmcnt`. So it orders LDS and control flow and says nothing about
+whether a wave's global stores have left the wave -- while `vmcnt` is per wave,
+so the lead thread's release drains the lead thread's wave and no other. A
+workgroup can announce "my piece is readable" with seven waves' stores in
+flight.
+
+Closing it with an agent-scope release fence in every thread works and **costs
+17.5% of the device ticks** at 128/128 -- rope and attention both double --
+because agent scope on this part writes L2 back per wave. It did not change any
+of the failures above, which is how we know it is not that bug. A
+workgroup-scope fence should emit the `s_waitcnt vmcnt(0)` without the
+writeback, and the lead thread's system-scope release already does the L2
+flush; that is the version to measure. Not yet done.
 
 ### The number that reframes all of this
 
