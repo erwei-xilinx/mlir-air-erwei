@@ -602,15 +602,23 @@ flush; that is the version to measure. Not yet done.
 |---|--:|--:|--:|
 | memory floor | 0.14 | 0.06x | 1x |
 | **Fleet mirage_mpk** | **2.452** | 1x | 18x |
-| **AIR now** | **~5.5** | **2.25x** | **39x** |
-| AIR before the reduction unroll | 8.9 | 3.6x | 64x |
+| **AIR now** | **3.42** | **1.39x** | **24x** |
+| AIR after the reduction unroll | 5.5 | 2.25x | 39x |
+| AIR before it | 8.9 | 3.6x | 64x |
 | torch eager | 10.42 | 4.3x | 75x |
 
-Two changes, in this order. The claim-path fix cost 0.84% and bought
-correctness, not speed -- the 8.85 that stood before it was a real number from
-a run that passed, but the program it measured had a live race that happened to
-win at 128 workers. Then `--reduce-unroll 8` took 1.61x off the whole model
-with bit-identical output, which is what moved 3.6x to 2.25x.
+Three changes, in this order.
+
+1. The claim-path fix cost 0.84% and bought correctness, not speed -- the 8.85
+   that stood before it was a real number from a run that passed, but the
+   program it measured had a live race that happened to win at 128 workers.
+2. `--reduce-unroll 8`: **1.61x**, bit-identical output. 3.6x -> 2.25x.
+3. The static claim: **1.60x**. 2.25x -> **1.39x**.
+
+Both of the wins came from the same kind of place, and neither was visible in
+the operator ranking. The ranking says which operator is expensive; it does not
+say what the operator is spending its time on, and in both cases the answer was
+something the stage was doing around the work rather than the work.
 
 The 8.9 is the timer sum, not a fresh `bench.sh`: 5 413 164 ticks at 100 MHz is
 54.1 ms for six steps, 9.0 ms a step, which agrees with the 8.85 `bench.sh`
@@ -723,6 +731,100 @@ them:
    exist, so 112 of 128 workgroups sit at the rendezvous. Splitting attention
    by (head, key block) with a flash-style combine is the real fix and the
    largest piece of work of the three.
+
+Of those three, 1 was measured and is a null, 2 turned out to be mostly a
+symptom of something else, and 3 is still open -- see below.
+
+### The lm head unroll is a null, and the reason is worth more than the change
+
+The same unroll wired into the lm head moved it from 159 364 ticks to 160 652,
+which is nothing. Reverted.
+
+The reason is the access pattern, and it is the same argument that explains the
+win in the layer matmuls. In `matmul_stage` a wave's lanes sit across output
+columns, so the eight loads a lane issues are eight *different* cache lines and
+unrolling multiplies the lines in flight by eight. The lm head weight is
+`[vocab][dim]` with the reduction index fastest, so one lane walks a row
+contiguously: its eight loads are eight bf16 out of the *same* 64-byte line, one
+transaction either way, and there is nothing to overlap.
+
+Which also says the lm head is not the thing to fix. At 159 000 ticks it moves
+311 MB in 0.27 ms/token, which is **1.17 TB/s** -- against 404 GB/s for gate_up
+after the unroll. It is by a wide margin the best-behaved stage here.
+
+And it explains the falsified `[out][in]` experiment. That layout gives every
+layer matmul the lm head's pattern, which is the faster one per lane -- but
+gate_up has 6144 output columns to hand to 65 536 lanes, so nine lanes in ten
+would have had nothing to do. The lm head gets away with it because it has
+151 936.
+
+### The task queue cost 1.60x
+
+`swiglu` was spending 14.7 us per layer step on about a thousandth of `qkv`'s
+arithmetic. Nothing about that is the elementwise operation. What a stage was
+paying for was the protocol that hands out its pieces: one successful claim
+atomic, one failing one, and two LDS broadcasts with four barriers, on a
+counter sixteen workgroups a chiplet are hammering. The atomics serialise, so
+the last workgroup on a chiplet waits behind all the others to be told which
+single piece is its.
+
+The queue was never needed to decide which piece is whose. The chiplet
+reporting protocol already gives a workgroup its rank among the workgroups on
+its chiplet and how many there are -- both workgroup-uniform, both already paid
+for -- and the pieces of chiplet d are exactly the indices congruent to d. So
+rank r takes every mycnt-th of them, and the partition is disjoint and complete
+by arithmetic. The stage that cannot be split gets it too: rather than every
+workgroup racing for a counter to find out which of them runs the rmsnorm, it
+is the first workgroup of the first chiplet, which every thread knows already.
+
+One-layer build: 14 queue atomics to 0, 81 `gpu.barrier` to 43, event protocol
+untouched at 44 `llvm.atomicrmw` either way.
+
+| ticks, 128/128 | queue | static |
+|---|--:|--:|
+| **whole model** | **3 300 436** | **2 051 136** |
+| swiglu | 242 264 | 52 364 |
+| qkv | 425 096 | 171 572 |
+| o_proj | 416 708 | 186 192 |
+| gate_up | 518 412 | 248 212 |
+| down | 496 312 | 281 508 |
+| rmsnorm.attn *wait* | 61 136 | **7 664** |
+
+The waits are where it reads most clearly. What the other 127 workgroups were
+waiting through at an rmsnorm was never the reduction over 1024 values -- it was
+the queue.
+
+**What it gives up.** Stealing, and with it the queue's tolerance for a chiplet
+the dispatcher skipped: that chiplet's pieces are never computed, the stage's
+event never reaches its total, and the launch hangs. So `dies` goes from "at
+least the chiplet count" to "exactly it". `workers >= dies` is checkable at
+generation time and is asserted; the rest is a property of the part and is why
+`dies` defaults to 8. `--dynamic-claim` puts the queue back and is still
+21/21.
+
+There is a way to drop the precondition: partition by the `air.launch` index
+rather than by chiplet rank. Piece `ix` would go to workgroup `ix % workers`,
+which exists by construction, and since the dispatcher round-robins workgroups
+across chiplets that lands piece `ix` on chiplet `ix % 8` -- the same mapping
+this has, with no assumption. Untried; the open question is whether the launch
+induction variable is reachable inside `air.segment`, whose captures are
+explicit.
+
+### What is left at 3.42 ms/token
+
+| | body+wait | share |
+|---|--:|--:|
+| four layer matmuls | 1 194 392 | 58% |
+| attention | 186 240 | 9.1% |
+| lm head | 172 044 | 8.4% |
+| two rmsnorms | 166 444 | 8.1% |
+| rope+kv_append | 162 988 | 7.9% |
+| argmax partial | 76 608 | 3.7% |
+| swiglu | 80 188 | 3.9% |
+
+`attention` and `rope+kv_append` are now the largest things that are not
+matmuls, and they are the two with `heads` = 16 pieces to hand to 128
+workgroups. That is the next one.
 
 ### The number that reframes all of this
 
