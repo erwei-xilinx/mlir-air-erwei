@@ -399,6 +399,55 @@ was the lm head.
 
 Use `--timers` to rank a change. Use `bench.sh` only to confirm a large one.
 
+### The task-count sweep, and what it rules out
+
+`tasks` is how many pieces a stage splits into, and `workers` the workgroups.
+Measured per operator, all at 8 waves:
+
+| ms/token | 32 | 64 | 128 | 256 |
+|---|--:|--:|--:|--:|
+| total | 21.52 | 12.72 | **8.87** | 11.06 |
+| gate_up | 7.33 | 4.08 | 2.41 | **2.03** |
+| qkv | 5.04 | 2.65 | 1.72 | **1.57** |
+| o_proj | 2.64 | 1.64 | **1.21** | 1.36 |
+| rmsnorm.mlp | 0.17 | 0.18 | **0.18** | **2.03** |
+
+**The four layer matmuls are bound by how many workgroups there are and by
+nothing else.** In particular not by cache-line utilisation, which varies the
+other way: a piece is `width/tasks` columns and the lanes spread across them,
+so o_proj uses 16 bytes of every 128-byte line at 128 tasks and 64 bytes at 32
+-- and 128 is twice as fast. That kills the "widen the slice" idea outright.
+
+It stops at 128 because of the other half. At 256 the matmuls keep improving
+and everything else gets worse, and the mechanism is visible in one row:
+**`single_stage` is a serialisation point.** One workgroup computes an rmsnorm
+while the rest wait at the rendezvous, and that wait grows with the worker
+count -- rmsnorm.mlp goes 0.18 to 2.03. So the only lever that still works on
+the matmuls is capped by the stages that are not matmuls.
+
+The vocabulary no longer forbids going past 128 (151936 = 2^7 * 1187 used to
+cap it); the rendezvous does.
+
+### The number that reframes all of this
+
+At batch one every weight is read exactly once per token. Qwen3-0.6B is ~553M
+parameters, so 1.1 GB of bf16, and MI350X has ~8 TB/s:
+
+    floor = 1.1 GB / 8 TB/s = 0.14 ms/token
+
+| | ms/token | x off the memory floor |
+|---|--:|--:|
+| roofline | 0.14 | 1x |
+| **Fleet mirage_mpk** | 2.452 | **18x** |
+| **AIR now** | 8.85 | **64x** |
+| torch eager | 10.42 | 75x |
+
+**Fleet is not the ceiling and catching it is not the goal.** It is 18x off a
+floor that a decode this small should be able to approach, and the remaining
+3.6x to Fleet is a smaller number than the 18x neither of them has claimed.
+Anything that gets AIR from 64x to 18x is worth more than anything that closes
+the last 3.6x, and the two are probably the same work.
+
 ## Closing the gap: 10 430 -> 153 ms/token, 2026-09-16
 
 Step 1 of the ranked fix above landed; steps 2 and 3 did not, and the reason
