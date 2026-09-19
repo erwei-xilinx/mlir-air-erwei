@@ -610,7 +610,8 @@ the other 41% was found and what it turned out to be.
 |---|--:|--:|--:|
 | memory floor | 0.14 | 0.06x | 1x |
 | **Fleet mirage_mpk** | **2.452** | 1x | 18x |
-| **AIR now, whole launch** | **3.68** | **1.50x** | **26x** |
+| **AIR now, whole launch** | **3.57** | **1.46x** | **26x** |
+| AIR before the arrival counts were packed | 3.68 | 1.50x | 26x |
 | AIR before the acquire fence was taken once | 5.44 | 2.22x | 39x |
 | AIR now, sum of the operators, windows closed | 5.44 | 2.22x | 39x |
 | AIR now, sum of the operators, as first measured | 3.20 | 1.30x | 23x |
@@ -1127,7 +1128,71 @@ boundary price and 0.19 at the new one, so folding the two rmsnorms and swiglu
 into their neighbours is now worth ~0.57 ms/token rather than 1.04. The
 rendezvous itself is the bigger target.
 
-### The per-class table on the current build
+### Three more at the boundary: one win, one small, one negative
+
+**Packing the arrival counts: -2.72%.** A die's workers must agree on how
+many pieces the die did and how many workers have arrived. In two words that
+is an add to each plus, for whoever is last, an acquire load to read the sum
+back -- three memory operations on the critical path. In one 64-bit word it
+is a single add of `(1 << 32) + pieces`, and the value handed back answers
+both: the top half is how many arrived first, the bottom half plus my own is
+the total, final because nobody adds after the last arriver.
+
+| | launch ticks | ms/token |
+|---|--:|--:|
+| two words | 2 205 240 | 3.675 |
+| **one word** | **2 145 348** | **3.576** |
+
+Suite 21/21, contend 5/5 at 256 workers, four shapes token-exact.
+
+**Sleeping between polls: 0.8%, and that is the finding.** The poll is
+`global_load_dword ... sc0 sc1` -- unanswerable from this XCD's L2, because
+whoever writes the word is on another one -- and 128 workgroups run it as
+tight as the hardware allows against a single line. A single uncached read
+does not cost the 2.65 us the rendezvous does, so congestion was the obvious
+suspect. `rocdl.s.sleep n` between polls, minimum of two runs a point, no
+point's runs more than 0.31% apart:
+
+| sleep | 0 | 1 | 2 | 4 | 8 | 16 |
+|---|--:|--:|--:|--:|--:|--:|
+| vs 0 | 0.00% | +0.56% | +0.26% | -0.11% | -0.67% | -0.80% |
+
+Cutting the traffic on that line sixteenfold is worth 0.8%. **So it is not
+congestion, it is latency** -- the interval between the last worker's release
+landing and the next poll seeing it. 16 is the default because it is free.
+The direction it rules out is the valuable part: the rendezvous is not going
+to be tuned away at the poll.
+
+**Fusing swiglu into gate_up: correct, and 0.63% slower.** A boundary is
+5.52 us and swiglu costs 6.63 us an instance, so nearly all of swiglu is the
+fact of being a stage. Fused -- one gate_up piece owning a gate column and
+its matching up column, reduced in one pass, SwiGLU applied where they meet,
+eight stages a layer instead of nine -- the launch went 2 143 380 to
+2 156 784.
+
+The mechanism is exact and worth keeping. Removing the boundary from 168
+instances is worth 92 736 ticks; the gate_up/swiglu pair did improve, by
+7 088; so the fused piece's weight reads cost 85 647 back. A fused piece owns
+`inter/tasks` gate columns and the matching up columns -- two 24-column
+strips, 48 bytes against a 64-byte line -- where the split stage read one
+48-column strip of 96 bytes.
+
+Restoring the 96-byte strip by halving the piece count, as o_proj and down
+do, is **10.4% worse** (2 369 096). Those two can afford it because at 128
+pieces they get 8 columns each, 16 bytes of a line, and losing half the
+workgroups is the cheaper of two bad options. gate_up is three times as wide
+and is the largest stage in the layer.
+
+**What would make it pay is the weight layout, not the fusion.** Interleave
+the gate and up halves of Wgu so column j's pair is adjacent, and a piece
+owning 24 pairs reads 96 contiguous bytes at 128 pieces, with the boundary
+gone for free. That is a change to weights.py and to both readers of the
+matrix. It is the next thing to try, and it applies to the two rmsnorms as
+well -- they are 6.4 and 6.9 us an instance and almost entirely boundary, and
+they fuse by a different route: the producer writes a partial sum of squares
+alongside its output and the consumer normalises inside its own reduction.
+
+### The per-class table (before the arrival counts were packed)
 
 3.73 ms/token on the launch that produced it, classes summing to 99.9% of it.
 `us/inst` is per stage instance: 168 a launch for a layer stage, 6 for an
