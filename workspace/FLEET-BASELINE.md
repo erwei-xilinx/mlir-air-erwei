@@ -610,7 +610,8 @@ the other 41% was found and what it turned out to be.
 |---|--:|--:|--:|
 | memory floor | 0.14 | 0.06x | 1x |
 | **Fleet mirage_mpk** | **2.452** | 1x | 18x |
-| **AIR now, whole launch** | **~5.5** | **~2.24x** | **39x** |
+| **AIR now, whole launch** | **3.68** | **1.50x** | **26x** |
+| AIR before the acquire fence was taken once | 5.44 | 2.22x | 39x |
 | AIR now, sum of the operators, windows closed | 5.44 | 2.22x | 39x |
 | AIR now, sum of the operators, as first measured | 3.20 | 1.30x | 23x |
 | AIR at the start of the day, end to end | ~8.9 | 3.6x | 64x |
@@ -1056,6 +1057,60 @@ Two levers, and they are independent:
   that is 2.4 ms/token, larger than every fusion together. `--pad-strip`
   measures which piece it is: a pad stage publishes nothing and nothing waits
   on its event, so pieces can be removed from one and the tokens stay right.
+
+### What the boundary is made of, and the 1.48x that came out of it
+
+Slopes of the launch clock against `--pad-stages`, each `--pad-strip` level
+removing one more piece, every point run twice and the minimum taken:
+
+| a pad stage contains | us/inst | the piece removed | us | share |
+|---|--:|---|--:|--:|
+| the whole boundary | 12.28 | | | |
+| no acquire fence | 4.86 | the fence | **7.42** | **60.4%** |
+| no rendezvous, spin or barrier | 2.14 | spin + barrier | 2.72 | 22.1% |
+| no signal, no atomics | -0.02 | the four atomics | 2.17 | 17.6% |
+| no claim | 0.08 | the claim | -0.10 | 0% |
+
+A pad with no fence, no spin and no atomics is indistinguishable from no pad
+at all -- -349 ticks on 3.25 M -- so the pieces account for the whole
+boundary, and the claim, which two commits were spent on, is free.
+
+The fence is `llvm.fence syncscope("") acquire`, which is `buffer_inv
+sc0 sc1`, and it ran in **all eight waves of every workgroup at every stage**.
+Taking it once, in the wave that already waits, inside the `scf.if` it waits
+in and before the barrier that releases the other seven:
+
+| | launch ticks | ms/token | x Fleet |
+|---|--:|--:|--:|
+| per wave | 3 265 096 | 5.44 | 2.22x |
+| **once a workgroup** | **2 209 060** | **3.68** | **1.50x** |
+
+**1.48x.** The decomposition predicted 1.67 ms/token for it and it delivered
+1.75, which is the best check there is that the instrument is measuring the
+program and not itself.
+
+Why it is sound: every wave of a workgroup is on one CU and one XCD, so one
+wave's invalidate empties the vector cache and the L2 all of them read
+through, and the barrier orders the rest of the workgroup's loads after it. A
+line refilled in between can only be fresh -- the producers wrote back past L2
+before they signalled, so anyone fetching that address afterwards gets the new
+value.
+
+Why it is believed: this is exactly the shape `megakernel_gen_contend` exists
+to catch, a workgroup whose waves disagree about memory, and that bug passed
+3/3 at 128 workers and failed 3/3 at 256. So the suite 21/21, the contending
+shape five more times at 256 workers with `total differences = 0` every time,
+and the model at 256/256, 512/128, 128/128 and 64/64 all agreeing with numpy
+token for token.
+
+**Agent scope on that fence does nothing** -- 3 262 472 against a baseline of
+3 265 096, and with `--acquire-once` already on, 2 215 288 against 2 214 204.
+The old "a wash" was right, for the wrong instrument.
+
+**What is left of the boundary.** 12.28 - 7.42 x 7/8 = 5.79 us, still 1.49 of
+the 3.68 ms a token now takes: 0.93 us of fence, 2.72 of spin and barrier,
+2.17 of atomics. And a stage removed by fusion is now worth 0.49 ms/token
+rather than 1.04, so the boundary is still the thing to attack first.
 
 ### The launch clock is bimodal, and it is all in gate_up
 
