@@ -610,7 +610,7 @@ the other 41% was found and what it turned out to be.
 |---|--:|--:|--:|
 | memory floor | 0.14 | 0.06x | 1x |
 | **Fleet mirage_mpk** | **2.452** | 1x | 18x |
-| **AIR now, whole launch** | **3.57** | **1.46x** | **26x** |
+| **AIR now, whole launch** | **3.58** | **1.46x** | **26x** |
 | AIR before the arrival counts were packed | 3.68 | 1.50x | 26x |
 | AIR before the acquire fence was taken once | 5.44 | 2.22x | 39x |
 | AIR now, sum of the operators, windows closed | 5.44 | 2.22x | 39x |
@@ -1183,14 +1183,50 @@ pieces they get 8 columns each, 16 bytes of a line, and losing half the
 workgroups is the cheaper of two bad options. gate_up is three times as wide
 and is the largest stage in the layer.
 
-**What would make it pay is the weight layout, not the fusion.** Interleave
-the gate and up halves of Wgu so column j's pair is adjacent, and a piece
-owning 24 pairs reads 96 contiguous bytes at 128 pieces, with the boundary
-gone for free. That is a change to weights.py and to both readers of the
-matrix. It is the next thing to try, and it applies to the two rmsnorms as
-well -- they are 6.4 and 6.9 us an instance and almost entirely boundary, and
-they fuse by a different route: the producer writes a partial sum of squares
+**The weight layout was supposed to be the answer, and it is not.**
+Interleaving the gate and up halves of Wgu -- column 2j gate, 2j+1 up -- gives
+a piece owning 24 pairs one run of 96 bytes again at 128 pieces, which should
+have handed back the whole 85 647. It was built: weights.py, the synthetic
+weight generator, the per-column scale, the host reference's matmul and its
+SwiGLU, and the device SwiGLU stage, with the checkpoint converted fresh into
+the new layout. Every part of it is correct -- suite 21/21 on the fused path
+and again on the split one, the model token-exact at 256/256, 512/128,
+128/128 and 64/64 -- and the fused build was **still 0.73% slower** than the
+split one measured beside it in the same job, 2 171 276 against 2 155 608.
+Reverted, because it is correct, buys nothing, and costs a manifest version,
+an assertion refusing older conversions, a forced re-conversion of every
+checkpoint, and five readers that have to stay in step.
+
+So the cache-line explanation is wrong, or not the whole thing, and the
+fusion's cost is open. The two forms move the same weight bytes. What differs
+is that a fused piece runs its two reductions **one after the other**, so the
+row it wants both columns of goes past twice with an entire reduction in
+between; adjacency cannot help if the line is gone by the time the second loop
+asks for it. The only shape where it could pay is a single reduction taking
+both columns per row into two accumulators -- a dot_loop over a 2-wide column
+block. Nobody has tried that.
+
+The two rmsnorms are still worth removing -- 6.4 and 6.9 us an instance,
+almost entirely boundary -- and they fuse by a different route that does not
+touch the weight reads at all: the producer writes a partial sum of squares
 alongside its output and the consumer normalises inside its own reduction.
+That is the fusion to try next, precisely because it cannot hit whatever the
+swiglu one hit.
+
+### The boundary ladder, re-run on the build with both fixes
+
+| a pad stage contains | us/inst | the piece removed | us | share |
+|---|--:|---|--:|--:|
+| the whole boundary | 5.15 | | | |
+| no acquire fence | 4.46 | the fence | 0.69 | 13% |
+| and no spin, no barrier | 1.93 | spin + barrier | 2.53 | 49% |
+| and no atomics | 0.07 | the atomics | 1.86 | 36% |
+
+**12.28 -> 5.52 -> 5.15 us.** 257 boundaries a step is 1.32 of the 3.58 ms a
+token takes, so 37% of the program is still the stages meeting, and half of
+that is the rendezvous -- which the sleep sweep says is latency, not
+congestion. Both of the changes that took the boundary from 12.28 to 5.15 came
+out of this ladder; it is the instrument that has paid for itself twice.
 
 ### The per-class table (before the arrival counts were packed)
 
