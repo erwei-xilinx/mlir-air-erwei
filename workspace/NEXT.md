@@ -1,18 +1,33 @@
 # 状态与下一步
 
-> **Fleet 的五个机制已在 MLIR-AIR 里全部复现,并在 MI300X 上真机数值验证。**
+> **Fleet 的五个机制已在 MLIR-AIR 里全部复现,并在真机上数值验证。**
 > 论文头条结果(信号削减)定量复现:device-scope 原子数 = die 数 × stage 数,
 > **与 worker 数无关**,所以削减比 = 每 die 的 worker 数(实测 2× / 4× / 8× / 16× / 32×)。
 >
-> **37 个 commit,已 push 到 `erwei-xilinx/mlir-air-erwei` 分支
-> `erwei/fix-gpu-conversion-passes`**;交接文档在 `erwei/air-gpu-notes`。
-> 工作区干净,`workspace/` 在代码分支上保持 untracked。
-> 最后一次全量:**GPU 执行测试 18/18 exit 0**,lit **310 过 / 240 挂**
+> **真实 Qwen3-0.6B 在一次 launch 里跑完 28 层、六个 step**,产出的 token 与
+> 独立 numpy 实现逐个相同:`"The capital of France is"` → `" Paris. The capital
+> of Italy"`。见 §2.9。
+>
+> **性能(MI350X / gfx950,2026-09-19):3.68 ms/token**,Fleet mirage_mpk 是
+> 2.452,内存下限 0.14。怎么跑出这个数、时间花在哪、用什么仪器量,**全部写在
+> `test/gpu/megakernel_gen/gen.py` 的模块头注释里**——那里是唯一的权威来源,
+> 不要从这份文件里的旧数字推。一句话版本:
+>
+> ```
+> QWEN_DIR=... TASKS=128 WORKERS=128 WAVES=8 STEPS=6 run_qwen.sh
+> ```
+>
+> 默认值就是快的那一套,不需要加任何 flag。
+>
+> 代码分支 `erwei/fix-gpu-conversion-passes`,交接文档在 `erwei/air-gpu-notes`
+> 的 `workspace/FLEET-BASELINE.md`(性能分析全在那里)。push 一律推 fork
+> `erwei-xilinx/mlir-air-erwei`,不推 origin。工作区干净,`workspace/` 在代码
+> 分支上保持 untracked。
+> 最后一次全量:**GPU 执行测试 21/21**,lit **310 过 / 240 挂**
 > (240 全是 AIE 关闭所致,与 GPU 路径无关)。
 >
-> **真实 Qwen3-0.6B 已在 MI300X 上真正解码**,28 层,一次 launch 六个 step,
-> 产出的 token 与独立 numpy 实现逐个相同:
-> `"The capital of France is"` → `" Paris. The capital of Italy"`。见 §2.9。
+> §1 的环境是 MI300X 的;MI350X 节点没有 /home,代码在
+> `/shared/erweiw/air350tree`,`source workspace/env350.sh`,长任务一律 sbatch。
 >
 > 历史过程记录在 `workspace/NEXT.history.md`(本文件的旧版,按时间叠加)。
 

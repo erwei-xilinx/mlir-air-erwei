@@ -49,14 +49,22 @@ export STEPS="${STEPS:-6}"
 #     9     1.1 s    40.1 and 50.4              nothing under 10 ms
 #   100    11.7 s    18.1 and 19.6              nothing under 1.5 ms
 #   300    35 s                                 ~0.5 ms, at +35 s a run
+#  4000    76 s      5.6 and 5.9                ~0.3 ms, at +4 min a point
 #
 # The 100 row is the correction: an earlier batch of four runs agreed to under
 # 1% and that was read as the resolution of the method. It is not -- it was the
-# resolution of that hour. Use 100 to rank changes worth several ms and 300 for
-# anything smaller, and never believe a difference smaller than a repeat of the
-# *same* snapshot taken in the same session.
+# resolution of that hour. At 100 this script is +/- 1.7 ms/token and it has
+# mis-ranked five changes; 4000 is the first setting that resolves anything
+# worth acting on, and the default is now 4000 for that reason. Never believe
+# a difference smaller than a repeat of the *same* snapshot in the same
+# session.
+#
+# Prefer the in-kernel clock where it will do. `TIMERS=1 REPEAT=20` on
+# run_qwen.sh prints the launch directly, reproduces to about 0.2%, and costs
+# one run rather than two; this script is for the end-to-end check, where the
+# device is a small part of the wall clock. See gen.py's module header.
 LO="${LO:-1}"
-HI="${HI:-100}"
+HI="${HI:-4000}"
 
 # Always run out of a snapshot, never out of the tree. A run takes minutes and
 # regenerates the IR each time; editing the generator while one is in flight

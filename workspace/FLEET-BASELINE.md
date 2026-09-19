@@ -1107,10 +1107,52 @@ token for token.
 3 265 096, and with `--acquire-once` already on, 2 215 288 against 2 214 204.
 The old "a wash" was right, for the wrong instrument.
 
-**What is left of the boundary.** 12.28 - 7.42 x 7/8 = 5.79 us, still 1.49 of
-the 3.68 ms a token now takes: 0.93 us of fence, 2.72 of spin and barrier,
-2.17 of atomics. And a stage removed by fusion is now worth 0.49 ms/token
-rather than 1.04, so the boundary is still the thing to attack first.
+**What is left of the boundary**, re-measured on the build that takes the
+fence once, same method, minimum of two runs a point:
+
+| a pad stage contains | us/inst | the piece removed | us | share |
+|---|--:|---|--:|--:|
+| the whole boundary | 5.52 | | | |
+| no acquire fence | 4.65 | the fence | 0.87 | 16% |
+| and no spin, no barrier | 1.99 | spin + barrier | 2.65 | 48% |
+| and no atomics | -0.09 | the four atomics | 2.09 | 38% |
+
+Predicted 5.79 from the old ladder, measured 5.52, and each piece landed where
+it was left: fence 0.87 against 7.42/8 = 0.93, spin 2.65 against 2.72, atomics
+2.09 against 2.17. So the boundary is still **1.42 of the 3.68 ms a token
+takes**, and it is now the rendezvous and the atomics rather than the fence.
+
+A stage removed by fusion is worth 0.35 -> **0.49 ms/token** at the old
+boundary price and 0.19 at the new one, so folding the two rmsnorms and swiglu
+into their neighbours is now worth ~0.57 ms/token rather than 1.04. The
+rendezvous itself is the bigger target.
+
+### The per-class table on the current build
+
+3.73 ms/token on the launch that produced it, classes summing to 99.9% of it.
+`us/inst` is per stage instance: 168 a launch for a layer stage, 6 for an
+extra, and about 5.5 of every one of them is the boundary.
+
+| | body | wait | share | us/inst |
+|---|--:|--:|--:|--:|
+| gate_up | 271 644 | 93 304 | 16.3% | 21.72 |
+| down | 290 528 | 55 064 | 15.5% | 20.57 |
+| o_proj | 221 592 | 43 856 | 11.9% | 15.80 |
+| qkv | 200 736 | 37 804 | 10.7% | 14.20 |
+| attention | 199 744 | 22 496 | 9.9% | 13.23 |
+| rope+kv_append | 177 600 | 17 076 | 8.7% | 11.59 |
+| lm_head | 173 820 | 384 | 7.8% | 290.34 |
+| rmsnorm.mlp | 104 736 | 11 656 | 5.2% | 6.93 |
+| swiglu | 88 888 | 22 488 | 5.0% | 6.63 |
+| rmsnorm.attn | 95 440 | 11 772 | 4.8% | 6.38 |
+| argmax_partial | 71 008 | 7 352 | 3.5% | 130.60 |
+| embed | 3 880 | 1 744 | 0.3% | 9.37 |
+| final_norm | 3 448 | 412 | 0.2% | 6.43 |
+| argmax_reduce | 4 192 | 440 | 0.2% | 7.72 |
+
+The three small layer stages are 6.4 to 6.9 us each and about 5.5 of that is
+the boundary, so what they compute costs around 1 us and there is nothing to
+win inside them -- only in not having them.
 
 ### The launch clock is bimodal, and it is all in gate_up
 
