@@ -1213,6 +1213,95 @@ alongside its output and the consumer normalises inside its own reduction.
 That is the fusion to try next, precisely because it cannot hit whatever the
 swiglu one hit.
 
+### Fleet measured, not quoted: 2.421 ms/token, and where it goes
+
+Everything above compares AIR against a single scalar. Fleet is sitting in
+`/shared/erweiw/fleet` with its source, so here it is measured on the same
+node in the same hour, and instrumented.
+
+| | ms/token |
+|---|--:|
+| Fleet mirage_mpk, run 1 | **2.421** |
+| Fleet mirage_mpk, run 2 | 2.425 |
+| AIR, same node, same hour | 3.584 |
+
+Fleet's per-iteration trace also shows its cost growing with the sequence:
+2.495 ms at iteration 300, 2.669 at 400, 2.816 at 500. AIR's figure is six
+steps off a five-token prompt, so the honest comparison is against Fleet's
+early iterations, and 2.42 is that.
+
+**Fleet instruments its own workers** (`MPK_ENABLE_TIMING`,
+persistent_kernel.cuh:1003-1006). Worker 0, eight tokens, 48 tasks:
+
+| | cycles | share |
+|---|--:|--:|
+| polling for a task | 3 156 136 | 37% |
+| waiting on dependencies | 4 439 028 | 52% |
+| **executing tasks** | **822 920** | **9.6%** |
+| signalling | 180 956 | 2% |
+
+**Fleet's workers are ninety percent idle.** That is not waste, it is the
+design: 240 workers and 8 schedulers on MI350X (utils.py:63-66), tasks sized
+per operator rather than per worker -- 1 task for an rmsnorm, 16 of 64
+columns for `down`, split-K blocks for qkv -- so whenever a task becomes
+ready some worker is free to start it immediately. AIR is the other
+philosophy: 128 workers, every stage cut into the same number of equal
+pieces, everyone at every boundary.
+
+### Two hypotheses off Fleet's source, both measured, both wrong
+
+**Width.** Fleet asks for 240 workers; AIR has been running 128 of the
+machine's 256 CUs, and the note in run_qwen.sh saying 128 is the ceiling is
+stale -- 256 generates and has always passed. AIR's own sweep said the layer
+matmuls are bound by worker count and nothing else (128/64/32 tasks giving
+8.87/12.72/21.52 ms/token), so half the GPU looked idle.
+
+| | launch ticks | ms/token | |
+|---|--:|--:|--:|
+| 128 workers | 2 150 296 | 3.584 | |
+| 256 workers | 2 514 352 | 4.191 | **+16.9%** |
+
+So AIR is **not** CU-starved, and that hypothesis is dead. 192 and 240 do not
+generate; 1024 does not divide by either.
+
+**The SwiGLU fusion, on Fleet's side of it.** Fusing into `gate_up` was 0.63%
+slower and interleaving the weights did not rescue it. Fleet fuses into
+`down` instead, which leaves the weight reads alone entirely, so the
+cache-line argument cannot apply.
+
+| | launch ticks | ms/token | |
+|---|--:|--:|--:|
+| split | 2 150 296 | 3.584 | |
+| fused into down | 2 896 208 | 4.827 | **+34.7%** |
+
+Correct -- suite 21/21, every shape token-exact -- and much worse. The reason
+is exact: `down` reduces over `inter` for each of `dim` output columns, and
+**every lane in this generator loads its own activation out of global
+memory**, so a fused SwiGLU is recomputed once per output column. 3 072
+transcendentals a layer become 3 145 728, and down's body goes 353 504 ticks
+to 809 024 -- the whole regression.
+
+### What Fleet actually has that AIR does not
+
+Fleet's `silu_mul_linear` stages the activation through LDS with double
+buffering and applies the SwiGLU once as it writes it there
+(silu_mul_linear_mi300.cuh:34, 190-192). Its matmuls stage **both** operands.
+AIR's `dot_loop` has every lane stream the whole reduction out of global
+memory by itself.
+
+That is the gap, and it is not the fusion and not the stage boundary:
+
+* it is why the consumer-side fusion costs 1024x the transcendental work
+  instead of nothing;
+* it is why AIR's activation traffic is multiplied by the number of columns
+  a lane group covers;
+* and it is why more workers do not help -- adding workers adds copies of
+  the same redundant global reads, which is what the +16.9% is.
+
+Staging the left-hand side once per workgroup is the next thing to build. It
+is worth more than every boundary saving identified so far, and it makes the
+fusion free rather than expensive.
+
 ### The boundary ladder, re-run on the build with both fixes
 
 | a pad stage contains | us/inst | the piece removed | us | share |
