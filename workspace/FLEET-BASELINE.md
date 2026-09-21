@@ -1302,6 +1302,91 @@ Staging the left-hand side once per workgroup is the next thing to build. It
 is worth more than every boundary saving identified so far, and it makes the
 fusion free rather than expensive.
 
+### Three interventions read off Fleet, all measured, all negative
+
+Each of these was the obvious next thing after reading Fleet's source. Each
+was built, validated (suite 21/21, every shape token-exact) and measured
+against the build beside it in the same job, two runs a point.
+
+| | launch ticks | ms/token | |
+|---|--:|--:|--:|
+| baseline | 2 143 080 | 3.572 | |
+| 256 workers instead of 128 | 2 514 352 | 4.191 | +16.9% |
+| SwiGLU fused into `down` | 2 896 208 | 4.827 | +34.7% |
+| activation staged in LDS | 2 457 900 | 4.096 | +14.7% |
+| staged **and** fused | 2 374 156 | 3.957 | +10.8% |
+
+**What each one rules out.**
+
+*Width.* Fleet asks for 240 workers on MI350X and AIR runs 128, so half the
+CUs looked idle. More workers is worse, twice over -- 256 is +16.9% on its
+own and +24.4% on top of staging. AIR is not CU-starved.
+
+*The fusion.* Fleet fuses the SwiGLU into `down`, the consumer, which leaves
+the weight reads untouched. Worse by a third, and the reason is exact:
+`down` reduces over `inter` for each of `dim` output columns and every AIR
+lane loads its own activation, so the SwiGLU is recomputed once per output
+column -- 3 072 transcendentals a layer become 3 145 728, and down's body
+goes 353 504 ticks to 809 024.
+
+*The traffic.* Every lane reloading the whole activation is 54.5 MB a layer
+against 31.5 MB of weights, and half of every lane's loads. Staging it in
+LDS is 14.7% worse, which says those loads were never expensive: the
+activation is 4 to 12 KB, every workgroup reads it, so it sits in L2 and
+they were all hits. Replacing a cached load with an LDS read and two
+barriers a piece costs more than it saves.
+
+**One thing did work.** On top of staging, the fusion is 3.4% *faster*,
+where without it it was 34.7% slower, and the emitted `math.exp` count goes
+from 255 back to 59 -- exactly the separate swiglu stage's number. The
+fusion mechanism is right. Its foundation is not.
+
+### What Fleet's own instrumentation says, in one token
+
+`MPK_ENABLE_TIMING` counters are per forward pass -- `tasks=48` whether the
+run decodes 8 tokens or 40 -- so this is one token of worker 0:
+
+| | cycles | share |
+|---|--:|--:|
+| polling for a task | 3 333 132 | 39.4% |
+| waiting on dependencies | 4 053 644 | 48.0% |
+| **executing tasks** | **845 876** | **10.0%** |
+| signalling | 217 020 | 2.6% |
+
+**Fleet finishes a token with its workers executing 10% of the time. AIR
+finishes a token with its workers in stage bodies about 63% of the time, and
+takes 1.48x longer doing it.** Fleet is not winning by keeping the machine
+busy; it is winning by needing less of it. (Different clocks -- clock64
+against s_memrealtime -- so read the shares, not a ratio between the two
+tables.)
+
+### What is left, and it is Little's law
+
+The three negatives between them rule out the CU count, the stage count and
+the activation traffic. What they leave is the one thing this file identified
+early and never finished acting on: bytes in flight.
+
+    to hold 8 TB/s open at ~1 us of latency:      8.0 MB in flight
+    AIR, unroll 8, one bf16 a load:               1.05 MB   13%
+    AIR at unroll 16 (tried; spills, no gain):    2.10 MB   26%
+    AIR, 4 adjacent columns a lane, dwordx4:      4.19 MB   52%
+
+**AIR's weight loads are one bf16 each** -- a `global_load_ushort` per
+weight. A lane reads down a *column* of the matrix, so it cannot vectorise
+along the reduction; adjacent lanes read adjacent columns and the hardware
+coalesces them into full lines, which is why the bandwidth is not terrible.
+But each lane still has only 2 bytes outstanding per load, and `--reduce-unroll
+16` is the wrong lever for that -- it was tried and gave the registers back
+to spills.
+
+The lever that is left is to give each lane **2 or 4 adjacent output
+columns** and load them as one `dwordx2`/`dwordx4`. Same coalescing, same
+accumulate order per column, a quarter of the load instructions, and four
+times the bytes outstanding for the same register budget. That is also, not
+coincidentally, what a CK GEMM does. It is the next thing to build, and it is
+the first remaining candidate that the three negatives above do not already
+rule out.
+
 ### The boundary ladder, re-run on the build with both fixes
 
 | a pad stage contains | us/inst | the piece removed | us | share |
