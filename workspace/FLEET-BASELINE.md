@@ -2638,3 +2638,68 @@ Explicit `vector.load` of the weights (identical ISA, 0.17%); unroll 4 and
 the claim mapping (right change, wrong mechanism); the line-coverage
 explanation of the bandwidth spread (right direction, one seventh of the
 size).
+
+### Re-pricing the boundary on the 2.94 ms build
+
+It is **5.04 us**, against 5.15 two builds and half a millisecond ago. That
+is what a cost independent of the body should do, and it is now **44%** of
+the launch rather than a third, purely because everything around it shrank.
+The slope is linear: one pad a layer gives 5.09 us, three give 5.04.
+
+| | us | share |
+|---|--:|--:|
+| the spin and its barrier | 2.40 | 48% |
+| the atomics | 1.71 | 34% |
+| the acquire fence | 0.79 | 16% |
+| the claim | 0.14 | 3% |
+
+**The atomics tier is not atomics.** `--count-flushes` adds one device-scope
+atomic per die per stage -- 2056 a step -- and the launch clock does not
+move (1 755 784 against 1 761 560, 0.3% on the *wrong* side of baseline). It
+is `monotonic` and carries no fence. So the 1.71 us is the release ordering
+on the two that do carry one: the per-workgroup agent-scope release on the
+die counter, an `s_waitcnt vmcnt(0)` draining the stage's stores, and the die
+leader's device-scope release, a `buffer_wbl2`. **Anything aimed at
+contention or at counting arrivals differently is aimed at the wrong thing.**
+
+**The spin is propagation, not backoff.** Sleep 0 is +2.2%, 4 is +1.4%, 16
+and 32 agree to 0.1%, 64 is +0.4%. There is no polling schedule that helps.
+
+**Two more arms, both still negative on the new body:**
+
+- 256 tasks and workers: **+13.6%**, after the body got a third faster.
+- `--fuse-swiglu`: **+1.3%**. It deletes 28 of the 257 boundaries, which the
+  ladder prices at 0.14 ms or 4.9%, so the fused gate_up body costs about 6%
+  more than gate_up and swiglu apart. The standing explanation was cache-line
+  coverage -- a fused piece reads two 24-column strips where the split stage
+  read one of 48. The layout change removed coverage as a mechanism and the
+  fusion is still slower. **That explanation is gone and nothing replaces
+  it.**
+
+### A generator bug worth not repeating
+
+`--count-flushes` was added in the middle of a 38-argument positional
+`emit()` call and silently took the next argument's value. The generator ran,
+the suite passed, the tokens were exact, and the flag was on when it had been
+asked to be off. Nothing in the test suite can see this.
+
+Found by checking that the flag changed the emitted MLIR -- now done for all
+thirteen of them, and the call site is keywords. **A flag that does not
+change the program is not a flag, and the check costs one diff.**
+
+### Where the next round has to start
+
+The body is 1.64 ms and the boundary is 1.30. Per boundary AIR is at 11.4 us
+all-in against Fleet's ~10.5 (2.421 ms over ~230 dependency resolutions a
+token), so the per-stage cost is within 8%; AIR has 257 of them to Fleet's
+~230, which is 12% more. **The gap is now mostly stage count and
+per-boundary cost, and the one fusion available makes the body worse by more
+than the boundary it saves.**
+
+What has not been tried: Fleet does not have 128 workgroups spinning on one
+counter. Its 240 workers poll private queues that 8 scheduler blocks fill, so
+its fan-in is 8 aggregators. That is the seventh Fleet mechanism and this
+reproduction does not have it. Whether it helps at batch 1, where the task
+graph is a strict chain and nobody has other work to overlap, is the open
+question -- and Fleet's own `[TIMING]` says its workers spend 39% polling and
+48% waiting on dependencies, so it is not obviously winning there either.
