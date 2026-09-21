@@ -2488,3 +2488,153 @@ USE_CK_FMHA=1           CK flash attention
 USE_FUSED_SILU=1        SiLU fused into gate_up
 MPK_DEVICE_TIMING=1 / MPK_EVENT_TIMING=1    per-task and per-event timing
 ```
+
+## Round eight: the matmul body, 3.572 -> 2.937 ms/token (2026-09-21)
+
+Four changes, each measured against a control in the same job on the same
+node, two runs an arm, REPEAT=20, suite 21/21 and tokens exact at 64, 128,
+256 and 512 tasks for every one of them.
+
+| | ticks | ms/token | |
+|---|--:|--:|---|
+| start of round | 2 143 080 | 3.572 | |
+| `--blocked-claim` | 2 075 284 | 3.452 | -3.2% |
+| `[output][reduction]` weights | 1 953 572 | 3.253 | -5.8% |
+| `--fold-klanes` + `--full-dim-tasks` | 1 762 300 | **2.937** | -10.4% |
+| Fleet mirage_mpk, same node | | **2.421** | gap **1.21x** |
+
+The method was the one the round was asked for: put AIR's per-class table
+next to the bytes each class moves, get a bandwidth per operator, and find
+what orders them. Four candidate orderings were built and measured. Three
+were wrong and saying how they were wrong is most of the value.
+
+### The five matmul classes, and what does not order them
+
+| class | MB/token | GB/s at the start of the round |
+|---|--:|--:|
+| lm_head | 311 | 1072 |
+| gate_up | 352 | 579 |
+| qkv | 235 | 591 |
+| down | 176 | 306 |
+| o_proj | 117 | 265 |
+
+**Cross-XCD line duplication: refuted by its own shape test.** A piece is a
+strip of adjacent output columns and piece `p` went to chiplet `p % 8`, so
+the eight pieces sharing a 128-byte line sat on eight XCDs with eight private
+L2s. The prediction, written before the run, was that `down` and `o_proj`
+(eight XCDs a line) would move most and `lm_head` (one) not at all.
+`lm_head` held. Everything else was backwards: `down` -1.8%, `o_proj` +0.3%,
+and the class that moved was **gate_up, -13.2%**.
+
+gate_up is the one stage whose piece -- 48 columns, 96 bytes -- does not
+divide a line, so three pieces in four straddle one; blocking makes a die's
+range twelve whole lines and the straddles internal. **The MALL absorbs
+cross-XCD duplication. Misalignment it cannot.** The change is worth 3.2% and
+is free, and the reason it was written for is not the reason it works.
+
+**Cache-line coverage: right order, wrong size by seven times.** `lm_head` is
+the one class whose weight is `[output][reduction]` -- gen.py:1276-1281
+transposes it back for exactly that reason -- so its lane walks the reduction
+contiguously and covers a whole line, where the four layer matmuls covered
+`cols * 2` bytes of one. Fleet stores every matmul that way
+(`linear_ck_mi300.cuh:406-408`, strides `(REDUCTION_SIZE, 1)`), which is also
+how the checkpoint arrives; `weights.py:107-126` was transposing it away.
+
+Flipping the four and giving each lane a contiguous slice of the reduction to
+go with it: **-5.7%**, against a -35% prediction. The shape held --
+
+| class | line bytes | delta |
+|---|--:|--:|
+| o_proj | 16 -> 128 | -11.8% |
+| down | 16 -> 128 | -10.3% |
+| qkv | 64 -> 128 | -10.3% |
+| gate_up | 96 -> 128 | -7.7% |
+| lm_head | 128, control | +1.4% |
+
+-- so coverage is real and directional and is not what sets a 4x spread.
+
+This is the first change in the series whose result is **not bit for bit** the
+previous build's: the two orders sum the reduction differently. That is why
+the token check is the arbiter and why it is run at four task counts.
+
+**Bytes in flight: already satisfied, and the ISA says so.** The standing
+lead from the previous round was Little's law -- one bf16 per weight load,
+1.05 MB outstanding against the ~8 MB needed. Writing the eight unrolled
+loads as one `vector.load` of `vector<8xbf16>` produced assembly with
+**exactly the same instruction counts** as the scalar form -- 206
+`global_load_dwordx4` and one `global_load_ushort` either way -- and a launch
+clock 0.17% apart. The layout change had already given the backend adjacent
+addresses and it had already merged them. The flag was deleted rather than
+kept.
+
+Dumping the ISA is one extra mlir-opt with
+`gpu-module-to-binary{format=isa}`, and it turned a day of tuning into a
+two-minute check. Do it first, not last.
+
+Bracketing the unroll under the new layout: **4 is +17.5%, 8 is the minimum,
+16 is +48%.** Not a ceiling imposed by spills, a real optimum.
+
+### What does order them: the epilogue chain
+
+The partials of the `waves * klanes` lanes sharing an output column were all
+going through LDS for lane c of wave 0 to walk in a single `iter_args` chain,
+once per column block. Its length over the weights a lane loads between two
+of them orders all five classes:
+
+| class | cols | klanes | nblk | chain | weights/lane | ratio | GB/s |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| lm_head | 64 | 1 | 19 | 152 | 2432 | 0.062 | 1078 |
+| gate_up | 32 | 2 | 2 | 32 | 128 | 0.250 | 734 |
+| qkv | 32 | 2 | 1 | 16 | 64 | 0.250 | 678 |
+| down | 16 | 4 | 1 | 32 | 96 | 0.333 | 363 |
+| o_proj | 16 | 4 | 1 | 32 | 64 | 0.500 | 316 |
+
+The lanes sharing a column differ only in the bits above `log2(cols)`, so an
+xor butterfly folds them in registers and one partial a wave goes to LDS.
+`ksteps` had been computed for this since the herd widening and never used --
+the comment describing the butterfly was in the file, the butterfly was not.
+
+**-3.2%**, and its shape held too: `down` -5.7% and `o_proj` -5.8% (chain
+32 -> 8), `qkv` -1.6% and `gate_up` -1.1% (16 -> 8), `lm_head` -0.3%
+(does not take this path).
+
+### And half the machine was idle on two stages
+
+`tasks_d = max(dies, tasks // 2)`: `o_proj` and `down` split 64 ways into
+16-column pieces rather than 128 ways into 8-column ones, so 64 of 128
+workgroups had nothing to do in them. That was the better trade under
+`[reduction][output]`, where the piece width **was** the line coverage. Under
+`[output][reduction]` a lane walks a row and the width does not touch
+coverage at all, so the trade is only workgroups against per-lane work.
+**-6.0%**, and with the butterfly **-10.4%** together:
+
+| class | base | both |
+|---|--:|--:|
+| down | 291 724 | 177 552 (-39.1%) |
+| o_proj | 223 788 | 151 632 (-32.2%) |
+| everything else | | within 2.5% |
+
+A decision that was right when it was made and wrong after a later change is
+not visible in any profile. It was found by reading why the constant existed.
+
+### Where it stands now
+
+The boundary was a third of the launch and is now **nearly half**: 257 of
+them a step at 5.15 us is 1.32 of 2.94 ms. Everything around it got faster
+and it did not. The next round is the boundary or it is nothing:
+
+- Re-price it on this build; 5.15 us was measured two builds ago.
+- Fleet does not have a global barrier between stages. Its 240 workers poll
+  private queues that 8 **scheduler** blocks fill, so its fan-in is 8
+  aggregators and not 128 workgroups on one counter. That is the seventh
+  Fleet mechanism and this reproduction does not have it.
+- `--fuse-swiglu` removes 28 of the 257 and is still 0.63% slower, which is
+  the one place a boundary has been removed and has not paid.
+
+### Falsified this round, do not redo
+
+Explicit `vector.load` of the weights (identical ISA, 0.17%); unroll 4 and
+16 under the new layout (+17.5%, +48%); the XCD-duplication explanation of
+the claim mapping (right change, wrong mechanism); the line-coverage
+explanation of the bandwidth spread (right direction, one seventh of the
+size).
