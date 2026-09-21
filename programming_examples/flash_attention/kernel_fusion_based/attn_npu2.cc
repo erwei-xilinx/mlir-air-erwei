@@ -429,7 +429,8 @@ void exp_g_minus_u(bfloat16 *u, bfloat16 *g) {
   // row block are independent, so unrolling them lets the
   // sub -> clamp -> mul -> exp2 latency overlap instead of being paid once per
   // vector (~27 cycles, mostly waiting, when the loop stays rolled — Peano
-  // ignores the chess pipelining pragmas).
+  // ignores the chess pipelining pragmas). Capped at 8: a full unroll keeps
+  // 2*col_blocks vector registers live, which spills once lkp > 64.
   // With bf16 lowest (not -inf), lowest - lowest = 0 (not NaN).
   constexpr int col_blocks = lkp / 8;
   constexpr int row_blocks = lqp / 8;
@@ -445,7 +446,7 @@ void exp_g_minus_u(bfloat16 *u, bfloat16 *g) {
   for (int rb = 0; rb < row_blocks; rb++) {
     V uvec = broadcast_rows_8x8(u + rb * 8);
     bfloat16 *__restrict p = g + rb * 64;
-#pragma clang loop unroll(full)
+#pragma clang loop unroll_count(8)
     for (int cb = 0; cb < col_blocks; cb++) {
       V d = aie::max(aie::sub(aie::load_v<64>(p + cb * block_stride), uvec),
                      lowest_vec);
