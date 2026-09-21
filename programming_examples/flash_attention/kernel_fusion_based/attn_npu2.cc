@@ -295,7 +295,9 @@ void neg_inf_fill_up_bf16(bfloat16 *c_out) {
   neg_inf_vectorized<bfloat16, lqp, 1, 32>(c_out);
 }
 
-#if lqp == 64 && lkp == 64
+// Guarded on lkp only: the 8x8 transpose needs exactly 8 column blocks, but the
+// row-block loop below is generic in lqp.
+#if lkp == 64
 void max_g_bf16(bfloat16 *in, bfloat16 *out) {
   SET_ROUNDING();
   // out[r] = max over the lkp columns of row r. G is column-major 8x8 tiled:
