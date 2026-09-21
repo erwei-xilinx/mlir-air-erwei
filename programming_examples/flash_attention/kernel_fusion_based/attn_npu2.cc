@@ -295,98 +295,37 @@ void neg_inf_fill_up_bf16(bfloat16 *c_out) {
   neg_inf_vectorized<bfloat16, lqp, 1, 32>(c_out);
 }
 
-// Guarded on lkp only: the 8x8 transpose needs exactly 8 column blocks, but the
-// row-block loop below is generic in lqp.
-#if lkp == 64
 void max_g_bf16(bfloat16 *in, bfloat16 *out) {
   SET_ROUNDING();
-  // out[r] = max over the lkp columns of row r. G is column-major 8x8 tiled:
-  // block (cb, rb) is 64 contiguous elements, row-major inside the block.
-  // Per row-block: (1) elementwise max across the 8 column blocks with an
-  // unrolled tree (no dependent chain), keeping the 8x8 result as two v32
-  // halves; (2) one 8x8 transpose puts each row's 8 partials in 8 different
-  // slices; (3) three vector max stages leave the 8 row maxima in one v8,
-  // stored with a single vector store instead of 4x reduce_max + 4 scalar
-  // stores per half.
+  // u = np.max(G, axis=-1, keepdims=True). G is column-major 8x8 tiled: block
+  // (cb, rb) is 64 contiguous elements, row-major inside. Per row block:
+  // (1) max across the column blocks into one 8x8 block; (2) an 8x8 transpose
+  // puts each row's 8 partials in 8 different slices; (3) three vector max
+  // stages leave the 8 row maxima in one v8, stored with a single vector store
+  // instead of 8 reduce_max and 8 scalar stores.
+  // Seed with bf16 lowest (0xff7f) rather than -inf (0xff80): a fully masked
+  // row then yields lowest > -inf, avoiding NaN in exp(G - u).
   constexpr int col_blocks = lkp / 8;
   constexpr int row_blocks = lqp / 8;
-  constexpr int block_stride = lqp * 8;
-  using V32 = aie::vector<bfloat16, 32>;
+  constexpr int block_stride = lqp * 8; // stride between column blocks
+  using V = aie::vector<bfloat16, 64>;
+
   uint16_t lowest_u16 = (uint16_t)0xff7f;
   bfloat16 lowest_val = *(bfloat16 *)&lowest_u16;
-  aie::vector<bfloat16, 8> lowest_vec = aie::broadcast<bfloat16, 8>(lowest_val);
+  V lowest_vec = aie::broadcast<bfloat16, 64>(lowest_val);
+
   for (int rb = 0; rb < row_blocks; rb++) {
     const bfloat16 *__restrict p = in + rb * 64;
-    V32 lo[8], hi[8];
-#pragma clang loop unroll(full)
-    for (int cb = 0; cb < col_blocks; cb++) {
-      lo[cb] = aie::load_v<32>(p + cb * block_stride);
-      hi[cb] = aie::load_v<32>(p + cb * block_stride + 32);
-    }
-    V32 l01 = aie::max(lo[0], lo[1]), l23 = aie::max(lo[2], lo[3]);
-    V32 l45 = aie::max(lo[4], lo[5]), l67 = aie::max(lo[6], lo[7]);
-    V32 h01 = aie::max(hi[0], hi[1]), h23 = aie::max(hi[2], hi[3]);
-    V32 h45 = aie::max(hi[4], hi[5]), h67 = aie::max(hi[6], hi[7]);
-    V32 mlo = aie::max(aie::max(l01, l23), aie::max(l45, l67));
-    V32 mhi = aie::max(aie::max(h01, h23), aie::max(h45, h67));
-    aie::vector<bfloat16, 64> m = aie::concat(mlo, mhi);
-    aie::vector<bfloat16, 64> t = aie::transpose(m, 8, 8);
-    V32 a = aie::max(t.extract<32>(0), t.extract<32>(1));
+    V m = lowest_vec;
+#pragma clang loop unroll(disable)
+    for (int cb = 0; cb < col_blocks; cb++)
+      m = aie::max(m, aie::load_v<64>(p + cb * block_stride));
+    V t = aie::transpose(m, 8, 8);
+    aie::vector<bfloat16, 32> a = aie::max(t.extract<32>(0), t.extract<32>(1));
     aie::vector<bfloat16, 16> b = aie::max(a.extract<16>(0), a.extract<16>(1));
-    aie::vector<bfloat16, 8> c = aie::max(b.extract<8>(0), b.extract<8>(1));
-    c = aie::max(c, lowest_vec);
-    aie::store_v(out + rb * 8, c);
+    aie::store_v(out + rb * 8, aie::max(b.extract<8>(0), b.extract<8>(1)));
   }
 }
-#else
-void max_g_bf16(bfloat16 *in, bfloat16 *out) {
-  SET_ROUNDING();
-  // u = np.max(G, axis=-1, keepdims=True)
-  // G is in column-major 8x8 tiled layout.
-  // Each block is 64 contiguous elements (8 rows × 8 cols).
-  // VecLen=32 reads 4 rows at once (half a block).
-  constexpr int VecLen = 32;
-  constexpr int BlockSize = 64; // 8×8 block
-  constexpr int ColsPerBlock = 8;
-  constexpr int RowsPerBlock = 8;
-  constexpr int col_blocks = lkp / ColsPerBlock;
-  constexpr int row_blocks = lqp / RowsPerBlock;
-  constexpr int block_stride =
-      lqp * ColsPerBlock; // stride between column blocks
-
-  // Use bf16 lowest (0xff7f) instead of -inf (0xff80) as initial max value.
-  // For fully-masked rows (all -inf), max returns bf16_lowest > -inf,
-  // avoiding NaN in exp(G - u) where G=-inf and u would be -inf.
-  uint16_t lowest_u16 = (uint16_t)0xff7f;
-  bfloat16 lowest_val = *(bfloat16 *)&lowest_u16;
-
-  bfloat16 *__restrict pOut = out;
-  for (int rb = 0; rb < row_blocks; rb++) {
-    // Process 4 rows at a time (half block = 32 elements)
-    for (int half = 0; half < 2; half++) {
-      aie::vector<bfloat16, VecLen> max_vec =
-          aie::broadcast<bfloat16, VecLen>(lowest_val);
-      int base = rb * BlockSize + half * VecLen;
-      for (int cb = 0; cb < col_blocks; cb++)
-        chess_prepare_for_pipelining chess_loop_range(8, ) {
-          aie::vector<bfloat16, VecLen> v =
-              aie::load_v<VecLen>(in + base + cb * block_stride);
-          max_vec = aie::max(max_vec, v);
-        }
-      // Extract per-row max from 32-wide vector (4 rows × 8 cols)
-      aie::vector<bfloat16, 8> r0 = max_vec.extract<8>(0);
-      aie::vector<bfloat16, 8> r1 = max_vec.extract<8>(1);
-      aie::vector<bfloat16, 8> r2 = max_vec.extract<8>(2);
-      aie::vector<bfloat16, 8> r3 = max_vec.extract<8>(3);
-      pOut[half * 4 + 0] = aie::reduce_max(r0);
-      pOut[half * 4 + 1] = aie::reduce_max(r1);
-      pOut[half * 4 + 2] = aie::reduce_max(r2);
-      pOut[half * 4 + 3] = aie::reduce_max(r3);
-    }
-    pOut += RowsPerBlock;
-  }
-}
-#endif
 
 void maximum_up_u_bf16(bfloat16 *up, bfloat16 *u) {
   SET_ROUNDING();
