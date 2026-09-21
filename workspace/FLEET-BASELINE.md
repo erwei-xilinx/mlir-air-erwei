@@ -2703,3 +2703,72 @@ reproduction does not have it. Whether it helps at batch 1, where the task
 graph is a strict chain and nobody has other work to overlap, is the open
 question -- and Fleet's own `[TIMING]` says its workers spend 39% polling and
 48% waiting on dependencies, so it is not obviously winning there either.
+
+### Cleanup audit of round eight
+
+The generator is the only durable record of what was tried, so a stale
+comment is worse than no comment: it sends the next session down a road that
+was already measured and closed. Rule applied: a figure describing the
+program **now** must be current; a figure describing what a change was worth
+**when it was made** is kept and marked as history.
+
+Four claims in the code were killed by the round's own later measurements and
+had to go:
+
+- `dot_loop`'s docstring said a wave has 128 bytes outstanding against the
+  tens of kilobytes it needs. The ISA closed that: already 206
+  `global_load_dwordx4` to one `global_load_ushort`.
+- The SwiGLU note ended by recommending LDS staging to make the fusion free.
+  Built: `--stage-lhs` is 14.7% alone, staged-and-fused 10.8% worse than
+  neither.
+- `matmul_stage` justified the two-way lane split partly on cache lines,
+  which does not survive `[output][reduction]`. The occupancy half survives
+  and is what `--half-dim-tasks` costs 6.0%.
+- The activation-traffic figure was 54.5 MB a layer with no derivation and is
+  62.9. Derivation now in the comment.
+
+**`--blocked-claim` re-measured: 0.6%, not 3.2%.** The layout change removed
+straddling, which was its whole mechanism, so most of its win went with it.
+It lost all three paired reps, so the remainder is real. A mechanism that
+predicts most of its own obsolescence is the best evidence it was the right
+mechanism -- and this is also the reason to re-measure every slow form after
+a big change rather than trusting the number it landed with.
+
+**Dead code: `lane_reduce` was unused next to a hand-inlined copy of itself.**
+`matmul_stage` now calls it; the only opcode-count difference at the real
+shape is 224 fewer `arith.addf`, two per matmul stage instance.
+
+### Cross-job drift is about 1%, and it nearly produced a wrong conclusion
+
+Three runs of the cleaned tree came in at 1 791 800 against 1 762 300 from an
+earlier job -- a 1.7% "regression" from a change that removes 224 no-op adds
+and nothing else. An A/B running both trees alternately in one job showed the
+sign flipping between paired reps and both sitting at ~1 774 000.
+
+| the same tree, four jobs | ticks |
+|---|--:|
+| fold.74351 | 1 762 300 |
+| ab.74425 | 1 763 268 |
+| final9.74434 | 1 776 112 |
+| verify9.74408 | 1 791 800 |
+
+**0.2% within a job, about 1% between them.** Never compare across jobs;
+alternate treatment and control inside one. This is the easiest way to reach
+a wrong conclusion in this setup and it has now done so twice.
+
+### What a future session should read, in order
+
+1. `test/gpu/megakernel_gen/gen.py`'s module docstring -- "Picking this up",
+   then "Where the 2.94 ms goes", then "What to try next". Kept current on
+   purpose; every number in it is measured.
+2. `run_qwen.sh`'s header for the environment knobs, grouped into the slow
+   forms, the correct-but-slower ones, and the instruments, each with cost.
+3. This file for the round-by-round history and for anything about Fleet
+   itself -- building it, running it, and reading its own `[TIMING]` and
+   `[TASK_TIME]` counters.
+
+The defaults are the fast configuration. A run that passes no flag is the run
+the headline comes from; every flag either restores something slower or is an
+instrument that costs something. All 38 are checked to change the emitted
+MLIR, after one of them silently took its neighbour's value through a
+38-argument positional call.
